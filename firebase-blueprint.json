@@ -1,0 +1,219 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Public/workspace identity profile keyed by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["User", "Admin"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "User Private Info",
+      "description": "Strictly owner-isolated PII sub-document storing verified account email.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "WorkspaceSnapshot": {
+      "title": "Workspace Snapshot",
+      "description": "Owner-isolated AD-PRMS operational summary snapshot persisted in Firestore.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "activeOwnerId": {
+          "type": "string",
+          "enum": ["OWN-ALPHA", "OWN-BETA"]
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "summary": {
+          "type": "object",
+          "description": "Native map holding workspace entity counts and latest audit hash."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "activeOwnerId",
+        "updatedByUid",
+        "revision",
+        "summary",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WorkspaceAuditEvent": {
+      "title": "Workspace Audit Event",
+      "description": "Append-only Firestore mirror of a tamper-evident AD-PRMS audit event.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerEntityId": {
+          "type": "string",
+          "enum": ["OWN-ALPHA", "OWN-BETA"]
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "sha256Hash": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "ownerEntityId", "actor", "action", "sha256Hash", "createdAt"]
+    },
+    "WorkspacePeriodClosure": {
+      "title": "Workspace Period Closure",
+      "description": "Append-only Firestore snapshot recorded on Ethiopian fiscal month close.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerEntityId": {
+          "type": "string",
+          "enum": ["OWN-ALPHA", "OWN-BETA"]
+        },
+        "periodCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 16
+        },
+        "trialBalanceDebitCents": {
+          "type": "integer"
+        },
+        "trialBalanceCreditCents": {
+          "type": "integer"
+        },
+        "journalCount": {
+          "type": "integer"
+        },
+        "closedByActor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "ownerEntityId",
+        "periodCode",
+        "trialBalanceDebitCents",
+        "trialBalanceCreditCents",
+        "journalCount",
+        "closedByActor",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Verified operator profile excluding PII."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Private PII sub-collection readable only by owner or admin."
+    },
+    "/workspaces/{workspaceId}": {
+      "schema": { "$ref": "#/entities/WorkspaceSnapshot" },
+      "description": "Owner-isolated AD-PRMS operational summary document."
+    },
+    "/workspaces/{workspaceId}/auditEvents/{eventId}": {
+      "schema": { "$ref": "#/entities/WorkspaceAuditEvent" },
+      "description": "Immutable append-only audit trail events under workspace Master Gate."
+    },
+    "/workspaces/{workspaceId}/periodClosures/{closureId}": {
+      "schema": { "$ref": "#/entities/WorkspacePeriodClosure" },
+      "description": "Immutable append-only period close trial balance snapshot under workspace Master Gate."
+    }
+  }
+}

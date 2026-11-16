@@ -1,0 +1,328 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Shared Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'berhaneunity@gmail.com'
+      );
+    }
+
+    // Entity Validation Blueprints (Anti-Update-Gap)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'role', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role in ['User', 'Admin']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkspaceSummary(summary) {
+      return summary is map
+        && summary.keys().hasAll([
+          'ownersCount',
+          'propertiesCount',
+          'unitsCount',
+          'chargesCount',
+          'receiptsCount',
+          'approvalsCount',
+          'auditEventsCount',
+          'latestAuditHash',
+          'ledgerJournalCount',
+          'trialBalanceTotalCents',
+          'lastClosedPeriod',
+          'threeWayCheckPassed'
+        ])
+        && summary.keys().hasOnly([
+          'ownersCount',
+          'propertiesCount',
+          'unitsCount',
+          'chargesCount',
+          'receiptsCount',
+          'approvalsCount',
+          'auditEventsCount',
+          'latestAuditHash',
+          'ledgerJournalCount',
+          'trialBalanceTotalCents',
+          'lastClosedPeriod',
+          'threeWayCheckPassed'
+        ])
+        && summary.ownersCount is int && summary.ownersCount >= 0 && summary.ownersCount <= 1000
+        && summary.propertiesCount is int && summary.propertiesCount >= 0 && summary.propertiesCount <= 10000
+        && summary.unitsCount is int && summary.unitsCount >= 0 && summary.unitsCount <= 100000
+        && summary.chargesCount is int && summary.chargesCount >= 0 && summary.chargesCount <= 500000
+        && summary.receiptsCount is int && summary.receiptsCount >= 0 && summary.receiptsCount <= 500000
+        && summary.approvalsCount is int && summary.approvalsCount >= 0 && summary.approvalsCount <= 500000
+        && summary.auditEventsCount is int && summary.auditEventsCount >= 0 && summary.auditEventsCount <= 1000000
+        && summary.latestAuditHash is string && summary.latestAuditHash.size() >= 1 && summary.latestAuditHash.size() <= 128
+        && summary.ledgerJournalCount is int && summary.ledgerJournalCount >= 0 && summary.ledgerJournalCount <= 1000000
+        && summary.trialBalanceTotalCents is int && summary.trialBalanceTotalCents >= 0
+        && summary.lastClosedPeriod is string && summary.lastClosedPeriod.size() >= 1 && summary.lastClosedPeriod.size() <= 32
+        && summary.threeWayCheckPassed is bool;
+    }
+
+    function isValidWorkspace(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'activeOwnerId',
+          'updatedByUid',
+          'revision',
+          'summary',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'activeOwnerId',
+          'updatedByUid',
+          'revision',
+          'summary',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerUid)
+        && data.activeOwnerId in ['OWN-ALPHA', 'OWN-BETA']
+        && isValidId(data.updatedByUid)
+        && data.revision is int && data.revision >= 0 && data.revision <= 1000000000
+        && isValidWorkspaceSummary(data.summary)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditEvent(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'ownerEntityId',
+          'actor',
+          'action',
+          'sha256Hash',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'ownerEntityId',
+          'actor',
+          'action',
+          'sha256Hash',
+          'createdAt'
+        ])
+        && isValidId(data.ownerUid)
+        && data.ownerEntityId in ['OWN-ALPHA', 'OWN-BETA']
+        && data.actor is string && data.actor.size() >= 1 && data.actor.size() <= 120
+        && data.action is string && data.action.size() >= 1 && data.action.size() <= 160
+        && isValidId(data.sha256Hash)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPeriodClosure(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'ownerEntityId',
+          'periodCode',
+          'trialBalanceDebitCents',
+          'trialBalanceCreditCents',
+          'journalCount',
+          'closedByActor',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'ownerEntityId',
+          'periodCode',
+          'trialBalanceDebitCents',
+          'trialBalanceCreditCents',
+          'journalCount',
+          'closedByActor',
+          'createdAt'
+        ])
+        && isValidId(data.ownerUid)
+        && data.ownerEntityId in ['OWN-ALPHA', 'OWN-BETA']
+        && data.periodCode is string && data.periodCode.size() >= 4 && data.periodCode.size() <= 16
+        && data.trialBalanceDebitCents is int && data.trialBalanceDebitCents >= 0
+        && data.trialBalanceCreditCents is int && data.trialBalanceCreditCents == data.trialBalanceDebitCents
+        && data.journalCount is int && data.journalCount >= 0
+        && data.closedByActor is string && data.closedByActor.size() >= 1 && data.closedByActor.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    // Bootstrapped Admins Registry
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && (isOwner(adminId) || isAdmin());
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    // User Profiles (No PII, Strict Self/Admin Scope)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == request.auth.uid
+        && incoming().role == 'User'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isValidUserProfile(incoming())
+        && (
+          isAdmin() ||
+          (
+            isOwner(userId)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        )
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // Strictly Isolated Private PII Subcollection
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId) && (isOwner(userId) || isAdmin());
+        allow list: if false;
+        allow create: if isValidId(userId)
+          && isValidId(docId)
+          && isOwner(userId)
+          && isValidUserPrivate(incoming())
+          && incoming().uid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId)
+          && isValidId(docId)
+          && isValidUserPrivate(incoming())
+          && (
+            isAdmin() ||
+            (
+              isOwner(userId)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+            )
+          )
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(docId) && isAdmin();
+      }
+    }
+
+    // Owner-Isolated Operational Workspaces
+    match /workspaces/{workspaceId} {
+      allow get: if isValidId(workspaceId)
+        && isSignedIn()
+        && (
+          isAdmin() ||
+          (resource == null && workspaceId == ('ws-' + request.auth.uid)) ||
+          (resource != null && existing().ownerUid == request.auth.uid)
+        );
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(workspaceId)
+        && isSignedIn()
+        && isValidWorkspace(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().updatedByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(workspaceId)
+        && isSignedIn()
+        && isValidWorkspace(incoming())
+        && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'activeOwnerId',
+              'updatedByUid',
+              'revision',
+              'summary',
+              'updatedAt'
+            ])
+          )
+        )
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().updatedByUid == request.auth.uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(workspaceId) && isAdmin();
+
+      // Master Gate + Append-Only Audit Events
+      match /auditEvents/{eventId} {
+        allow get: if isValidId(workspaceId)
+          && isValidId(eventId)
+          && isSignedIn()
+          && (
+            isAdmin() ||
+            get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerUid == request.auth.uid
+          );
+        allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+        allow create: if isValidId(workspaceId)
+          && isValidId(eventId)
+          && isSignedIn()
+          && exists(/databases/$(database)/documents/workspaces/$(workspaceId))
+          && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerUid == request.auth.uid
+          && isValidAuditEvent(incoming())
+          && incoming().ownerUid == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update, delete: if false;
+      }
+
+      // Append-Only Period Close Snapshots
+      match /periodClosures/{closureId} {
+        allow get: if isValidId(workspaceId)
+          && isValidId(closureId)
+          && isSignedIn()
+          && (
+            isAdmin() ||
+            get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerUid == request.auth.uid
+          );
+        allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+        allow create: if isValidId(workspaceId)
+          && isValidId(closureId)
+          && isSignedIn()
+          && exists(/databases/$(database)/documents/workspaces/$(workspaceId))
+          && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerUid == request.auth.uid
+          && isValidPeriodClosure(incoming())
+          && incoming().ownerUid == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
