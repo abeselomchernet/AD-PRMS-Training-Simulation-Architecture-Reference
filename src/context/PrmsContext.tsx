@@ -774,6 +774,8 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const skipNextSaveRef = useRef(false);
   const pendingSaveTimerRef = useRef<number | null>(null);
   const dirtyForSaveRef = useRef(false);
+  const saveInFlightRef = useRef(false);
+  const queuedSaveRef = useRef(false);
   const latestSeedRef = useRef(seed);
   latestSeedRef.current = seed;
   const latestMetaRef = useRef({ username: session.username, ownerId: activeOwnerId });
@@ -874,6 +876,86 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [canSyncOfficeDb]);
 
+  const flushOfficeSave = useCallback(() => {
+    if (saveInFlightRef.current) {
+      queuedSaveRef.current = true;
+      return;
+    }
+    saveInFlightRef.current = true;
+    queuedSaveRef.current = false;
+    dirtyForSaveRef.current = false;
+
+    void fetch('/api/office/state', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        state: latestSeedRef.current,
+        updatedBy: latestMetaRef.current.username || 'office-user',
+        expectedRevision: officeRevisionRef.current,
+        originClientId: getRealtimeClientId(),
+        ownerId: latestMetaRef.current.ownerId,
+      }),
+    })
+      .then(async (res) => {
+        if (res.status === 409) {
+          const latestRes = await fetch('/api/office/state', { cache: 'no-store' });
+          if (latestRes.ok) {
+            const latestJson = (await latestRes.json()) as {
+              initialized?: boolean;
+              revision?: number;
+              state?: Partial<SeedState> | null;
+            };
+            if (typeof latestJson.revision === 'number') {
+              officeRevisionRef.current = latestJson.revision;
+            }
+            if (latestJson.initialized && latestJson.state) {
+              skipNextSaveRef.current = true;
+              setSeed({ ...createInitialSeedState(), ...latestJson.state });
+            }
+          }
+          setToasts((prev) =>
+            [
+              {
+                id: `TST-CONFLICT-${Date.now()}`,
+                tone: 'warning' as const,
+                title: 'Workspace Sync Conflict Reconciled',
+                detail: 'Another tab saved newer changes; synced latest SQLite revision.',
+              },
+              ...prev,
+            ].slice(0, 4)
+          );
+          return;
+        }
+        if (res.ok) {
+          const json = (await res.json()) as { revision?: number };
+          if (typeof json.revision === 'number') {
+            officeRevisionRef.current = json.revision;
+          }
+        }
+      })
+      .catch(() => {
+        // Offline-safe
+      })
+      .finally(() => {
+        saveInFlightRef.current = false;
+        if (queuedSaveRef.current) {
+          queuedSaveRef.current = false;
+          flushOfficeSave();
+        }
+      });
+
+    if (firebaseOperatorRef.current) {
+      void syncWorkspaceSnapshotToFirestore({
+        uid: firebaseOperatorRef.current.uid,
+        activeOwnerId: latestMetaRef.current.ownerId,
+        revision: officeRevisionRef.current ?? 1,
+        seed: latestSeedRef.current,
+      }).catch(() => {
+        // Non-blocking background snapshot sync
+      });
+    }
+  }, []);
+
   useEffect(() => {
     if (!canSyncOfficeDb || !officeHydratedRef.current) return;
     if (skipNextSaveRef.current) {
@@ -888,70 +970,9 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     pendingSaveTimerRef.current = window.setTimeout(() => {
       pendingSaveTimerRef.current = null;
-      dirtyForSaveRef.current = false;
-      void fetch('/api/office/state', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          state: latestSeedRef.current,
-          updatedBy: latestMetaRef.current.username || 'office-user',
-          expectedRevision: officeRevisionRef.current,
-          originClientId: getRealtimeClientId(),
-          ownerId: latestMetaRef.current.ownerId,
-        }),
-      })
-        .then(async (res) => {
-          if (res.status === 409) {
-            const latestRes = await fetch('/api/office/state', { cache: 'no-store' });
-            if (latestRes.ok) {
-              const latestJson = (await latestRes.json()) as {
-                initialized?: boolean;
-                revision?: number;
-                state?: Partial<SeedState> | null;
-              };
-              if (typeof latestJson.revision === 'number') {
-                officeRevisionRef.current = latestJson.revision;
-              }
-              if (latestJson.initialized && latestJson.state) {
-                skipNextSaveRef.current = true;
-                setSeed({ ...createInitialSeedState(), ...latestJson.state });
-              }
-            }
-            setToasts((prev) =>
-              [
-                {
-                  id: `TST-CONFLICT-${Date.now()}`,
-                  tone: 'warning' as const,
-                  title: 'Workspace Sync Conflict Reconciled',
-                  detail: 'Another tab saved newer changes; synced latest SQLite revision.',
-                },
-                ...prev,
-              ].slice(0, 4)
-            );
-            return;
-          }
-          if (res.ok) {
-            const json = (await res.json()) as { revision?: number };
-            if (typeof json.revision === 'number') {
-              officeRevisionRef.current = json.revision;
-            }
-          }
-        })
-        .catch(() => {
-          // Offline-safe
-        });
-      if (firebaseOperatorRef.current) {
-        void syncWorkspaceSnapshotToFirestore({
-          uid: firebaseOperatorRef.current.uid,
-          activeOwnerId: latestMetaRef.current.ownerId,
-          revision: officeRevisionRef.current ?? 1,
-          seed: latestSeedRef.current,
-        }).catch(() => {
-          // Non-blocking background snapshot sync
-        });
-      }
+      flushOfficeSave();
     }, 250);
-  }, [canSyncOfficeDb, seed]);
+  }, [canSyncOfficeDb, seed, flushOfficeSave]);
 
   useEffect(() => {
     if (!canSyncOfficeDb) return;

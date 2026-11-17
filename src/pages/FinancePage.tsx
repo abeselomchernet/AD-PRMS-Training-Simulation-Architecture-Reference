@@ -1021,8 +1021,9 @@ export const FinancePage: React.FC = () => {
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
-              <label className="font-semibold block mb-1">Fiscal Period (13-Month)</label>
+              <label htmlFor="manual-journal-period" className="font-semibold block mb-1">Fiscal Period (13-Month)</label>
               <select
+                id="manual-journal-period"
                 value={manualForm.periodCode}
                 onChange={(e) => setManualForm({ ...manualForm, periodCode: e.target.value })}
                 className="w-full px-3 py-2 border border-[#CBD5E1] dark:border-[#2D405B] bg-white dark:bg-[#152236] rounded-lg font-mono"
@@ -1035,8 +1036,9 @@ export const FinancePage: React.FC = () => {
               </select>
             </div>
             <div>
-              <label className="font-semibold block mb-1">Entry Date</label>
+              <label htmlFor="manual-journal-date" className="font-semibold block mb-1">Entry Date</label>
               <input
+                id="manual-journal-date"
                 type="date"
                 required
                 value={manualForm.entryDate}
@@ -1045,8 +1047,9 @@ export const FinancePage: React.FC = () => {
               />
             </div>
             <div>
-              <label className="font-semibold block mb-1">Evidence Ref</label>
+              <label htmlFor="manual-journal-evidence" className="font-semibold block mb-1">Evidence Ref</label>
               <input
+                id="manual-journal-evidence"
                 required
                 value={manualForm.evidenceRef}
                 onChange={(e) => setManualForm({ ...manualForm, evidenceRef: e.target.value })}
@@ -1062,8 +1065,9 @@ export const FinancePage: React.FC = () => {
           )}
 
           <div>
-            <label className="font-semibold block mb-1">Journal Narration / Description</label>
+            <label htmlFor="manual-journal-description" className="font-semibold block mb-1">Journal Narration / Description</label>
             <input
+              id="manual-journal-description"
               required
               value={manualForm.description}
               onChange={(e) => setManualForm({ ...manualForm, description: e.target.value })}

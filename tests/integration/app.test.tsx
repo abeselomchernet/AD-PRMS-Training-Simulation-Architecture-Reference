@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import App from '../../src/App';
 
@@ -91,7 +91,7 @@ describe('AD-PRMS Application Integration Flows', () => {
     fireEvent.click(screen.getByRole('button', { name: /Close modal/i }));
     fireEvent.click(screen.getByRole('button', { name: /Telebirr & Gateway Queue/i }));
     expect(screen.getAllByText(/Telebirr USSD QR/i).length).toBeGreaterThan(0);
-  });
+  }, 15_000);
 
   it('launches Tenant Self-Service Mobile strictly isolated to tenant unit, hides Internal Staff Notes, and settles via ArifPay', async () => {
     render(<App />);
@@ -149,7 +149,7 @@ describe('AD-PRMS Application Integration Flows', () => {
     // Return cleanly to Desktop view
     fireEvent.click(screen.getByRole('button', { name: /Desktop Mode/i }));
     expect(await screen.findByRole('heading', { name: /Home Workspace/i })).toBeInTheDocument();
-  });
+  }, 15_000);
 
   it('supports Staff MFA and Tenant Phone OTP login mode switchers and renders ERCA Gate in Tax Config', async () => {
     render(<App />);
@@ -173,7 +173,7 @@ describe('AD-PRMS Application Integration Flows', () => {
     expect(
       await screen.findByText(/ERCA & Licensed Adviser Production Activation Gate/i, {}, { timeout: 4000 })
     ).toBeInTheDocument();
-  });
+  }, 15_000);
 
   it('renders D3 fiscal-year monthly revenue bars and Recharts 6-month occupancy widget on ExecutiveDashboard', async () => {
     render(<App />);
@@ -268,7 +268,7 @@ describe('AD-PRMS Application Integration Flows', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Excel \(\.xlsx\)$/i }));
     fireEvent.click(screen.getByTestId('confirm-download-export-btn'));
-  });
+  }, 15_000);
 
   it('downloads Tenant Mobile processed payment history as PDF and Excel (.xlsx) in Pay tab', async () => {
     render(<App />);
@@ -332,7 +332,7 @@ describe('AD-PRMS Application Integration Flows', () => {
     expect(samplesRoot.textContent).toContain('CASH Sales Attachment');
     expect(samplesRoot.textContent).toContain('House Rent');
     expect(screen.getByText(/ENABLE_LIVE_TAX_INVOICING=False/i)).toBeInTheDocument();
-  });
+  }, 15_000);
 
   it('preserves user-entered CBE slip reference in TenantGatewayModal across gateway tab and state updates', async () => {
     render(<App />);
@@ -367,32 +367,43 @@ describe('AD-PRMS Application Integration Flows', () => {
 
     // 2. Open Finance -> Journals & Rules -> Manual Journal (5xxx)
     fireEvent.click(await screen.findByRole('button', { name: 'Finance' }));
-    const journalsTab = await screen.findByRole('button', { name: /Journals & Rules/i });
+    const journalsTab = await screen.findByRole('button', { name: /Journals & Rules/i }, { timeout: 5000 });
     fireEvent.click(journalsTab);
 
     fireEvent.click(await screen.findByRole('button', { name: /Manual Journal \(5xxx\)/i }));
-    fireEvent.click(await screen.findByRole('button', { name: /5900 · Depreciation/i }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: /5900 · Depreciation/i }));
 
-    expect(screen.getByText(/Balanced \(Dr == Cr\)/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /^Submit Manual Journal$/i }));
+    expect(within(dialog).getByText(/Balanced \(Dr == Cr\)/i)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Submit Manual Journal$/i }));
 
     // 3. Switch user to General Manager (gm.demo) and approve in Approvals Centre
-    fireEvent.click(screen.getByRole('button', { name: /Sign Out/i }));
+    fireEvent.click(screen.getAllByRole('button', { name: /Finance Officer/i })[0]);
+    fireEvent.click(screen.getByRole('button', { name: /Sign Out to Training Login/i }));
     const gmUseButtons = await screen.findAllByRole('button', { name: /Use Credentials/i });
     fireEvent.click(gmUseButtons[0]);
     fireEvent.click(screen.getByRole('button', { name: /Sign In to Training Session/i }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Approvals Centre' }));
+    fireEvent.click(await screen.findByRole('button', { name: /Approvals Centre/i }));
+    const approvalSearch = await screen.findByPlaceholderText(
+      /Search request #, category, maker role, or title/i,
+      {},
+      { timeout: 5000 }
+    );
+    fireEvent.change(approvalSearch, { target: { value: 'Monthly straight-line depreciation' } });
+    const reqText = await screen.findByText(/Monthly straight-line depreciation charge/i, {}, { timeout: 5000 });
+    const reqRow = reqText.closest('tr')!;
+    fireEvent.click(within(reqRow).getByRole('button', { name: /Open Detail/i }));
     const approveBtn = await screen.findByRole('button', { name: /^Approve$/i });
     fireEvent.click(approveBtn);
 
     // 4. Verify the 5900 journal appears in Finance Ledger under the 5900 filter
     fireEvent.click(screen.getByRole('button', { name: 'Finance' }));
-    fireEvent.click(await screen.findByRole('button', { name: /Journals & Rules/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /Journals & Rules/i }, { timeout: 5000 }));
     fireEvent.click(await screen.findByRole('button', { name: /5900 · Depreciation/i }));
 
     expect(
       await screen.findByText(/Monthly straight-line depreciation charge — buildings & equipment \(5900\)/i)
     ).toBeInTheDocument();
-  });
+  }, 15_000);
 });

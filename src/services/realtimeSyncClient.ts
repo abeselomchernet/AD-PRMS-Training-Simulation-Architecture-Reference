@@ -90,7 +90,13 @@ async function connectSocket() {
         if (parsed.kind === 'sync:event' && parsed.event) {
           dispatchToListeners(parsed.event);
         } else if (parsed.kind === 'sync:hello' && Array.isArray(parsed.recentEvents)) {
-          parsed.recentEvents.forEach(dispatchToListeners);
+          parsed.recentEvents.forEach((ev) => {
+            if (ev.type === 'state:synced' || ev.type === 'state:reset') {
+              if (ev.eventId) seenEvents.add(ev.eventId);
+              return;
+            }
+            dispatchToListeners(ev);
+          });
         }
       } catch {
         // Ignore malformed frames

@@ -165,5 +165,115 @@ test.describe('AD-PRMS End-to-End Governance, Isolation & UI Flows', () => {
     await page.getByRole('button', { name: /^More$/i }).click();
     await expect(page.getByText(/All 22 Platform Modules/i)).toBeVisible();
   });
+
+  test('5xxx Manual Journal UI workflow (5600/5800/5900) and SQLite /api/office/ledger endpoints', async ({
+    page,
+  }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', (err) => pageErrors.push(err.message));
+
+    // 1. Sign in as Finance Officer and open Finance -> Journals & Rules -> Manual Journal (5xxx)
+    await signInAs(page, 'finance.demo');
+    await page.getByRole('button', { name: 'Finance', exact: true }).click();
+    await page.getByRole('button', { name: /Journals & Rules/i }).click();
+
+    await page.getByRole('button', { name: /Manual Journal \(5xxx\)/i }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('button', { name: /5600 · Bank Charges/i }).click();
+    await expect(dialog.getByLabel('Journal Narration / Description')).toHaveValue(/\(5600\)/);
+    await dialog.getByRole('button', { name: /5800 · Interest Expense/i }).click();
+    await expect(dialog.getByLabel('Journal Narration / Description')).toHaveValue(/\(5800\)/);
+    await dialog.getByRole('button', { name: /5900 · Depreciation/i }).click();
+    await expect(dialog.getByText(/Balanced \(Dr == Cr\)/i)).toBeVisible();
+
+    const saveAfterSubmit = page.waitForResponse(
+      (res) => res.url().includes('/api/office/state') && res.request().method() === 'PUT'
+    );
+    await dialog.getByRole('button', { name: /^Submit Manual Journal$/i }).click();
+    await expect(page.getByText(/Manual Journal Queued in Approvals Centre/i)).toBeVisible();
+    await saveAfterSubmit;
+
+    // 2. Sign out and approve as General Manager (Maker-Checker SoD)
+    await page.getByRole('button', { name: /Finance Officer/i }).first().click();
+    await page.getByRole('button', { name: /Sign Out to Training Login/i }).click();
+    await signInAs(page, 'gm.demo');
+
+    await page.getByRole('button', { name: /Approvals Centre/i }).click();
+    await page
+      .getByPlaceholder(/Search request #, category, maker role, or title/i)
+      .fill('Monthly straight-line depreciation');
+    const mjRow = page.locator('tr', { hasText: /Monthly straight-line depreciation charge/i }).first();
+    await expect(mjRow).toBeVisible();
+    await mjRow.getByRole('button', { name: /Open Detail/i }).click();
+    const saveAfterApprove = page.waitForResponse(
+      (res) => res.url().includes('/api/office/state') && res.request().method() === 'PUT'
+    );
+    await page.getByRole('button', { name: /^Approve$/i }).click();
+    await saveAfterApprove;
+
+    // 3. Verify journal renders in Finance -> Journals & Rules under 5900 filter
+    await page.getByRole('button', { name: 'Finance', exact: true }).click();
+    await page.getByRole('button', { name: /Journals & Rules/i }).click();
+    await page.getByRole('button', { name: /5900 · Depreciation/i }).click();
+    await expect(
+      page.getByText(/Monthly straight-line depreciation charge — buildings & equipment \(5900\)/i).first()
+    ).toBeVisible();
+
+    // 4. Verify live SQLite ledger endpoints (/accounts, /journals?accountPrefix=5, /trial-balance, /post, /reverse)
+    const acctsRes = await page.request.get('/api/office/ledger/accounts?ownerId=OWN-ALPHA');
+    expect(acctsRes.ok()).toBe(true);
+    const acctsJson = await acctsRes.json();
+    expect(acctsJson.accounts.some((a: { code: string }) => a.code === '5600')).toBe(true);
+
+    const postRes = await page.request.post('/api/office/ledger/post', {
+      data: {
+        ownerId: 'OWN-ALPHA',
+        entryDate: '2026-12-08',
+        periodCode: '2019-03',
+        ruleId: 'Manual',
+        sourceType: 'ManualJournal',
+        sourceId: 'E2E-5600',
+        idempotencyKey: `E2E-5600-${Date.now()}`,
+        description: 'E2E SQLite 5600 bank charge',
+        makerActorId: 'USR-SYNTH-03',
+        checkerActorId: 'USR-SYNTH-02',
+        lines: [
+          { accountCode: '5600', debitCents: 35000, creditCents: 0 },
+          { accountCode: '1020', debitCents: 0, creditCents: 35000 },
+        ],
+      },
+    });
+    expect(postRes.ok()).toBe(true);
+    const postJson = await postRes.json();
+    expect(postJson.ok).toBe(true);
+
+    const fiveXxxRes = await page.request.get('/api/office/ledger/journals?ownerId=OWN-ALPHA&accountPrefix=5');
+    expect(fiveXxxRes.ok()).toBe(true);
+    const fiveXxxJson = await fiveXxxRes.json();
+    expect(fiveXxxJson.journals.some((j: { id: string }) => j.id === postJson.journalId)).toBe(true);
+
+    const tbRes = await page.request.get('/api/office/ledger/trial-balance?ownerId=OWN-ALPHA&periodCode=2019-03');
+    expect(tbRes.ok()).toBe(true);
+    const tbJson = await tbRes.json();
+    expect(tbJson.balanced).toBe(true);
+
+    const revRes = await page.request.post('/api/office/ledger/reverse', {
+      data: {
+        ownerId: 'OWN-ALPHA',
+        journalId: postJson.journalId,
+        entryDate: '2026-12-08',
+        periodCode: '2019-03',
+        reason: 'E2E PR-25 reversal check',
+        makerActorId: 'USR-SYNTH-03',
+        checkerActorId: 'USR-SYNTH-02',
+      },
+    });
+    expect(revRes.ok()).toBe(true);
+    const revJson = await revRes.json();
+    expect(revJson.ok).toBe(true);
+
+    expect(pageErrors).toEqual([]);
+  });
 });
 
