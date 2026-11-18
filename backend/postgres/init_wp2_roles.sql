@@ -16,7 +16,12 @@ END $$;
 GRANT USAGE ON SCHEMA public TO adprms_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO adprms_app;
 -- AuditEvent must remain append-only even at privilege level in addition to triggers
-REVOKE UPDATE, DELETE, TRUNCATE ON TABLE governance_auditevent FROM adprms_app;
+DO $$
+BEGIN
+    IF to_regclass('governance_auditevent') IS NOT NULL THEN
+        REVOKE UPDATE, DELETE, TRUNCATE ON TABLE governance_auditevent FROM adprms_app;
+    END IF;
+END $$;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO adprms_app;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO adprms_app;

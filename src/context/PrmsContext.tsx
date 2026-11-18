@@ -15,7 +15,12 @@ import {
 import { canSwitchOwnerForRole, checkActionPermission, checkApprovalAuthority } from '../policies/rbac';
 import { buildBilingualSmsBody, postSmsDispatchToServer } from '../services/smsNotificationService';
 import { createDefaultOromifaTemplates } from '../data/oromifaContractTemplate';
-import { getRealtimeClientId, publishRealtimeEvent, subscribeRealtimeEvents } from '../services/realtimeSyncClient';
+import {
+  disconnectRealtimeSocket,
+  getRealtimeClientId,
+  publishRealtimeEvent,
+  subscribeRealtimeEvents,
+} from '../services/realtimeSyncClient';
 import {
   appendAuditEventToFirestore,
   FirebaseAuthenticatedOperator,
@@ -783,6 +788,8 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const firebaseOperatorRef = useRef<FirebaseAuthenticatedOperator | null>(null);
   const [firebaseAuthReady, setFirebaseAuthReady] = useState(false);
   const [firebaseUid, setFirebaseUid] = useState<string | null>(null);
+  const [officeSessionReady, setOfficeSessionReady] = useState(false);
+  const [officeSessionRole, setOfficeSessionRole] = useState<'staff' | 'tenant' | null>(null);
 
   const canSyncOfficeDb =
     typeof window !== 'undefined' &&
@@ -814,8 +821,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [canSyncOfficeDb, firebaseAuthReady, firebaseUid]);
 
   useEffect(() => {
-    if (!canSyncOfficeDb) {
-      officeHydratedRef.current = true;
+    if (!canSyncOfficeDb || !officeSessionReady || officeSessionRole !== 'staff') {
       return;
     }
 
@@ -874,9 +880,12 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       cancelled = true;
     };
-  }, [canSyncOfficeDb]);
+  }, [canSyncOfficeDb, officeSessionReady, officeSessionRole]);
 
   const flushOfficeSave = useCallback(() => {
+    if (!officeSessionReady || officeSessionRole !== 'staff' || currentPersona.role === 'Auditor / Read-only reviewer') {
+      return;
+    }
     if (saveInFlightRef.current) {
       queuedSaveRef.current = true;
       return;
@@ -954,10 +963,11 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Non-blocking background snapshot sync
       });
     }
-  }, []);
+  }, [officeSessionReady, officeSessionRole, currentPersona.role]);
 
   useEffect(() => {
-    if (!canSyncOfficeDb || !officeHydratedRef.current) return;
+    if (!canSyncOfficeDb || !officeSessionReady || officeSessionRole !== 'staff' || !officeHydratedRef.current) return;
+    if (currentPersona.role === 'Auditor / Read-only reviewer') return;
     if (skipNextSaveRef.current) {
       skipNextSaveRef.current = false;
       return;
@@ -972,12 +982,12 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       pendingSaveTimerRef.current = null;
       flushOfficeSave();
     }, 250);
-  }, [canSyncOfficeDb, seed, flushOfficeSave]);
+  }, [canSyncOfficeDb, officeSessionReady, officeSessionRole, currentPersona.role, seed, flushOfficeSave]);
 
   useEffect(() => {
-    if (!canSyncOfficeDb) return;
+    if (!canSyncOfficeDb || !officeSessionReady || officeSessionRole !== 'staff') return;
     const flushPendingSave = () => {
-      if (!dirtyForSaveRef.current) return;
+      if (!dirtyForSaveRef.current || currentPersona.role === 'Auditor / Read-only reviewer') return;
       dirtyForSaveRef.current = false;
       if (pendingSaveTimerRef.current) {
         window.clearTimeout(pendingSaveTimerRef.current);
@@ -1001,7 +1011,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       window.removeEventListener('pagehide', flushPendingSave);
     };
-  }, [canSyncOfficeDb]);
+  }, [canSyncOfficeDb, officeSessionReady, officeSessionRole, currentPersona.role]);
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -1124,6 +1134,27 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setActiveSection('dashboard');
       setIsAuthenticated(true);
 
+      if (canSyncOfficeDb) {
+        setOfficeSessionReady(false);
+        void fetch('/api/office/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: account.username,
+            password: rawPassword.trim(),
+          }),
+        })
+          .then((res) => {
+            if (res.ok) {
+              setOfficeSessionRole('staff');
+              setOfficeSessionReady(true);
+            }
+          })
+          .catch(() => {
+            // Static or offline preview operates cleanly in memory
+          });
+      }
+
       setSeed((prev) => ({
         ...prev,
         auditEvents: [
@@ -1160,7 +1191,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
       return { ok: true };
     },
-    [locale, notify]
+    [canSyncOfficeDb, locale, notify]
   );
 
   const loginWithFirebaseOperator = useCallback(
@@ -1244,11 +1275,18 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }));
     firebaseOperatorRef.current = null;
     setFirebaseUid(null);
+    setOfficeSessionReady(false);
+    setOfficeSessionRole(null);
+    officeHydratedRef.current = false;
+    disconnectRealtimeSocket();
+    if (canSyncOfficeDb) {
+      void fetch('/api/office/auth/logout', { method: 'POST' }).catch(() => {});
+    }
     void signOutFirebase();
     setCommandPaletteOpen(false);
     setIsAuthenticated(false);
     setActiveSection('dashboard');
-  }, [activeOwnerId, appendAuditEvent, currentPersona.role, session.actorId, session.username]);
+  }, [activeOwnerId, appendAuditEvent, canSyncOfficeDb, currentPersona.role, session.actorId, session.username]);
 
   const switchOwnerContext = useCallback(
     (ownerId: OwnerId) => {
@@ -1352,16 +1390,14 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
     skipNextSaveRef.current = true;
     setSeed(nextResetState);
-    if (canSyncOfficeDb) {
+    if (canSyncOfficeDb && officeSessionReady) {
       void fetch('/api/office/reset', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Office-Role': currentPersona.role,
         },
         body: JSON.stringify({
           state: nextResetState,
-          resetBy: session.username,
           originClientId: getRealtimeClientId(),
           ownerId: activeOwnerId,
         }),
@@ -1389,7 +1425,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       title: 'Training Environment Reset (Trainer Control)',
       detail: 'All synthetic records, compliance registers, approvals, and SQLite office persistence were restored.',
     });
-  }, [activeOwnerId, canSyncOfficeDb, currentPersona.role, logPermissionDenial, notify, session.actorId, session.actorName, session.isTrainer, session.username]);
+  }, [activeOwnerId, canSyncOfficeDb, currentPersona.role, logPermissionDenial, notify, officeSessionReady, session.actorId, session.actorName, session.isTrainer, session.username]);
 
   const toggleExerciseStep = useCallback((exerciseId: string, stepIndex: number) => {
     setExerciseStepChecks((prev) => {
@@ -4725,8 +4761,9 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
 
-    const unsubscribe = subscribeRealtimeEvents((ev) => {
-      if ((ev.type === 'state:synced' || ev.type === 'state:reset') && canSyncOfficeDb) {
+    const unsubscribe = officeSessionReady
+      ? subscribeRealtimeEvents((ev) => {
+      if ((ev.type === 'state:synced' || ev.type === 'state:reset') && canSyncOfficeDb && officeSessionRole === 'staff') {
         void fetch('/api/office/state', { cache: 'no-store' })
           .then(async (res) => {
             const ct = res.headers.get('content-type') || '';
@@ -4804,14 +4841,15 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
         return prev;
       });
-    });
+      })
+      : () => {};
 
     return () => {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
       unsubscribe();
     };
-  }, [canSyncOfficeDb, flushOfflineSyncQueue, notify]);
+  }, [canSyncOfficeDb, flushOfflineSyncQueue, notify, officeSessionReady, officeSessionRole]);
 
   const loginAsTenant = useCallback(
     (rawUsername: string, rawPassword: string): { ok: boolean; error?: string } => {
@@ -4841,6 +4879,24 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setActiveTenantAccount(account);
       setMobileMode('tenant-mobile');
       setIsAuthenticated(false);
+      if (canSyncOfficeDb) {
+        setOfficeSessionReady(false);
+        void fetch('/api/office/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: account.username,
+            password: rawPassword.trim(),
+          }),
+        })
+          .then((res) => {
+            if (res.ok) {
+              setOfficeSessionRole('tenant');
+              setOfficeSessionReady(true);
+            }
+          })
+          .catch(() => {});
+      }
       notify({
         tone: 'info',
         title: `${account.displayName}`,
@@ -4851,13 +4907,19 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
       return { ok: true };
     },
-    [locale, notify]
+    [canSyncOfficeDb, locale, notify]
   );
 
   const logoutTenant = useCallback(() => {
+    setOfficeSessionReady(false);
+    setOfficeSessionRole(null);
+    disconnectRealtimeSocket();
+    if (canSyncOfficeDb) {
+      void fetch('/api/office/auth/logout', { method: 'POST' }).catch(() => {});
+    }
     setActiveTenantAccount(null);
     setMobileMode('desktop');
-  }, []);
+  }, [canSyncOfficeDb]);
 
   const dispatchAutomatedSmsReminder = useCallback(
     (input: {

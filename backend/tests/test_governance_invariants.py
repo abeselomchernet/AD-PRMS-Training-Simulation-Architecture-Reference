@@ -1,10 +1,19 @@
+from datetime import date
 import hashlib
 import hmac
 import json
 import logging
 
+from django.core.exceptions import ValidationError
+from django.db import connection, transaction
+import pytest
+
 from apps.common.crypto import normalize_ethiopian_msisdn
 from apps.common.logging import PiiMaskingFilter
+from apps.common.permissions import bind_postgres_rls_owner
+from apps.governance.models import ApprovalRequest, AuditEvent, ErcaVerificationGate
+from apps.portfolio.models import OwnerEntity, PartyIdentity, Property
+from apps.portfolio.services import assert_inter_entity_posting_permitted, seed_single_title_holder_portfolio
 
 
 def test_msisdn_normalization():
@@ -40,9 +49,6 @@ def test_pii_masking_filter_redacts_msisdn_bearer_and_otp():
 
 
 def test_maker_checker_model_blocks_self_approval():
-    from django.core.exceptions import ValidationError
-    from apps.governance.models import ApprovalRequest
-
     req = ApprovalRequest(
         request_number='REQ-UNIT-001',
         category='Finance',
@@ -52,19 +58,36 @@ def test_maker_checker_model_blocks_self_approval():
         maker_actor_id='ACT-FIN-01',
         maker_role='Finance Officer',
     )
-    try:
+    with pytest.raises(ValidationError):
         req.assert_checker_sod('ACT-FIN-01')
-        assert False, 'Expected ValidationError on self-approval'
-    except ValidationError:
-        pass
 
-    # Independent checker passes
     req.assert_checker_sod('ACT-GM-01')
 
 
-def test_erca_gate_blocks_active_tax_rule_without_four_signoffs():
-    from apps.governance.models import ErcaVerificationGate
+def test_approval_payload_hash_integrity_and_execution_verification():
+    payload = {'period_code': '2019-03', 'amount': '1500.00'}
+    req = ApprovalRequest(
+        request_number='REQ-HASH-001',
+        category='Finance',
+        title='Manual Journal',
+        target_record_type='JournalEntry',
+        target_record_id='MJ-1',
+        maker_actor_id='ACT-FIN-01',
+        maker_role='Finance Officer',
+        status='Approved',
+        finalized=True,
+        payload_json=payload,
+        payload_hash=ApprovalRequest.compute_payload_hash(payload),
+        approved_checker_actor_id='ACT-GM-01',
+        decision_log=[{'actor_id': 'ACT-GM-01', 'action': 'Approved'}],
+    )
+    assert req.verify_approved_for_execution(expected_payload=payload) == 'ACT-GM-01'
 
+    with pytest.raises(ValidationError):
+        req.verify_approved_for_execution(expected_payload={'period_code': '2019-03', 'amount': '9999.00'})
+
+
+def test_erca_gate_blocks_active_tax_rule_without_four_signoffs():
     gate = ErcaVerificationGate(
         erca_tin_verified=True,
         vat_certificate_verified=True,
@@ -75,3 +98,85 @@ def test_erca_gate_blocks_active_tax_rule_without_four_signoffs():
 
     gate.owner_activation_approved = True
     assert gate.can_activate_tax_rules() is True
+
+
+@pytest.mark.django_db(transaction=True)
+def test_single_title_holder_five_buildings_and_inter_entity_block():
+    with transaction.atomic():
+        owner = OwnerEntity.objects.create(
+            code='OWN-DEKEBO',
+            name='Abdulwehab Dekebo',
+            entity_type='Undetermined',
+            effective_date=date(2026, 1, 1),
+        )
+        bind_postgres_rls_owner('OWN-DEKEBO')
+        result = seed_single_title_holder_portfolio(owner=owner)
+        assert result['title_holder'] == 'Abdulwehab Dekebo'
+        assert len(result['buildings']) == 5
+        assert result['pending_trading_identity'] == 'Abdulwehab Dekebo Trading'
+
+        trading = PartyIdentity.objects.get(owner=owner, code='PARTY-TRADING-PENDING')
+        assert trading.inter_entity_posting_enabled is False
+        assert trading.confirmation_status == PartyIdentity.ConfirmationStatus.PENDING_DOCUMENTARY
+
+        with pytest.raises(ValidationError):
+            assert_inter_entity_posting_permitted(owner=owner, target_party_code='PARTY-TRADING-PENDING')
+
+
+@pytest.mark.django_db(transaction=True)
+def test_audit_event_hash_chain_and_rls_context_isolation():
+    with transaction.atomic():
+        owner_a = OwnerEntity.objects.create(
+            code='OWN-GOV-A',
+            name='Owner A',
+            entity_type='Individual',
+            effective_date=date(2026, 1, 1),
+        )
+        owner_b = OwnerEntity.objects.create(
+            code='OWN-GOV-B',
+            name='Owner B',
+            entity_type='Individual',
+            effective_date=date(2026, 1, 1),
+        )
+
+        bind_postgres_rls_owner('OWN-GOV-A')
+        ev1 = AuditEvent.objects.create(
+            owner=owner_a,
+            actor_id='ACT-1',
+            persona='Finance Officer',
+            module='Ledger',
+            action='Create',
+            record_type='JournalEntry',
+            record_id='J1',
+            reason='Initial test event',
+        )
+        ev2 = AuditEvent.objects.create(
+            owner=owner_a,
+            actor_id='ACT-2',
+            persona='General Manager',
+            module='Ledger',
+            action='Approve',
+            record_type='JournalEntry',
+            record_id='J1',
+            reason='Second test event',
+        )
+        assert ev2.prev_hash == ev1.event_hash
+
+        with pytest.raises(ValidationError):
+            ev1.reason = 'Tampered'
+            ev1.save()
+        with pytest.raises(ValidationError):
+            ev1.delete()
+
+        Property.objects.create(
+            owner=owner_a,
+            code='P-A1',
+            name='Prop A1',
+            sub_city='Bole',
+            woreda='03',
+            property_type='Commercial',
+            effective_date=date(2026, 1, 1),
+        )
+        if connection.vendor == 'postgresql':
+            bind_postgres_rls_owner('OWN-GOV-B')
+            assert Property.objects.filter(code='P-A1').count() == 0

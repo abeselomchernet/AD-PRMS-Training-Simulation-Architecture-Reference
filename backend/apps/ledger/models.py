@@ -1,5 +1,6 @@
 from decimal import Decimal
 import uuid
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
 from apps.portfolio.models import Lease, OwnerEntity, TenantProfile, Unit
@@ -11,15 +12,18 @@ class Ledger(models.Model):
         CASH = 'Cash', 'Cash'
 
     class EntityType(models.TextChoices):
+        UNDETERMINED = 'Undetermined', 'Undetermined (Pending Documentary Confirmation)'
         SOLE_PROPRIETOR = 'SoleProprietor', 'Individual / Sole Proprietor'
         PLC = 'PLC', 'PLC / Share Company'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     owner = models.OneToOneField(OwnerEntity, on_delete=models.PROTECT, related_name='ledger')
     ledger_code = models.CharField(max_length=48, unique=True)
-    entity_type = models.CharField(max_length=24, choices=EntityType.choices, default=EntityType.SOLE_PROPRIETOR)
+    entity_type = models.CharField(max_length=24, choices=EntityType.choices, default=EntityType.UNDETERMINED)
     vat_registered = models.BooleanField(default=False)
     withholding_agent = models.BooleanField(default=False)
+    enforce_daily_cash_cap = models.BooleanField(default=False)
+    daily_cash_cap_etb = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('50000.00'))
     basis = models.CharField(max_length=16, choices=Basis.choices, default=Basis.ACCRUAL)
     framework = models.CharField(max_length=64, default='Ethiopian SME / IPSAS-aligned')
     enable_live_tax_invoicing = models.BooleanField(default=False)
@@ -56,7 +60,7 @@ class LedgerAccount(models.Model):
 
     class Meta:
         unique_together = ('owner', 'code', 'version')
-        indexes = [models.Index(fields=['owner', 'code', 'status'])]
+        indexes = [models.Index(fields=['owner', 'code', 'status'], name='ledger_acct_owner_code_idx')]
 
 
 class AccountingPeriod(models.Model):
@@ -119,6 +123,8 @@ class JournalEntry(models.Model):
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.POSTED)
     maker_actor_id = models.CharField(max_length=64)
     checker_actor_id = models.CharField(max_length=64, blank=True)
+    approval_request_id = models.UUIDField(null=True, blank=True, db_index=True)
+    approval_payload_hash = models.CharField(max_length=64, blank=True)
     reversal_of_journal = models.ForeignKey(
         'self', null=True, blank=True, on_delete=models.PROTECT, related_name='reversing_entries'
     )
@@ -130,7 +136,7 @@ class JournalEntry(models.Model):
 
     class Meta:
         unique_together = [('owner', 'journal_number'), ('owner', 'idempotency_key')]
-        indexes = [models.Index(fields=['owner', 'period', 'entry_date'])]
+        indexes = [models.Index(fields=['owner', 'period', 'entry_date'], name='ledger_jrn_owner_per_dt_idx')]
 
 
 class JournalLine(models.Model):
@@ -155,6 +161,56 @@ class JournalLine(models.Model):
                 name='ledger_line_single_sided',
             ),
         ]
+
+
+class DepositMovement(models.Model):
+    """
+    Independent append-only tenant security-deposit subledger (#11).
+    Tracks receipts, refunds, deductions, lease transfers, and opening balances
+    independently of JournalLine so 3-way tie-out checks real subledger divergence.
+    """
+
+    class MovementType(models.TextChoices):
+        RECEIPT = 'Receipt', 'Receipt'
+        REFUND = 'Refund', 'Refund'
+        DEDUCTION = 'Deduction', 'Deduction'
+        LEASE_TRANSFER = 'LeaseTransfer', 'Lease Transfer'
+        OPENING_BALANCE = 'OpeningBalance', 'Opening Balance'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(OwnerEntity, on_delete=models.PROTECT, related_name='deposit_movements')
+    tenant = models.ForeignKey(TenantProfile, on_delete=models.PROTECT, related_name='deposit_movements')
+    lease = models.ForeignKey(Lease, on_delete=models.PROTECT, related_name='deposit_movements')
+    movement_type = models.CharField(max_length=24, choices=MovementType.choices)
+    signed_amount_etb = models.DecimalField(max_digits=14, decimal_places=2)
+    effective_date = models.DateField()
+    reference = models.CharField(max_length=128)
+    posted_journal = models.ForeignKey(
+        JournalEntry, null=True, blank=True, on_delete=models.PROTECT, related_name='deposit_movements'
+    )
+    maker_actor_id = models.CharField(max_length=64)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['owner', 'tenant', 'effective_date'], name='ledger_dep_own_ten_dt_idx')]
+
+    def clean(self) -> None:
+        if self.tenant_id and self.owner_id and self.tenant.owner_id != self.owner_id:
+            raise ValidationError('Cross-owner invariant violation: DepositMovement.owner must match Tenant.owner.')
+        if self.lease_id and self.owner_id and self.lease.owner_id != self.owner_id:
+            raise ValidationError('Cross-owner invariant violation: DepositMovement.owner must match Lease.owner.')
+        if self.signed_amount_etb == Decimal('0.00'):
+            raise ValidationError('DepositMovement signed_amount_etb cannot be zero.')
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError('DepositMovement is append-only and cannot be modified.')
+        self.clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('DepositMovement is append-only and cannot be deleted.')
 
 
 class LeaseAccountingSchedule(models.Model):
@@ -231,12 +287,17 @@ class FixedAssetItem(models.Model):
 class TaxRulePack(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     pack_id = models.CharField(max_length=64, unique=True)
+    version = models.PositiveIntegerField(default=1)
     proclamation_ref = models.CharField(max_length=128)
     effective_from = models.DateField()
     effective_to = models.DateField(null=True, blank=True)
     lifecycle_stage = models.CharField(max_length=24, default='Draft')
+    reviewer_name = models.CharField(max_length=128, blank=True)
+    reviewer_license_ref = models.CharField(max_length=128, blank=True)
+    approval_history_json = models.JSONField(default=list, blank=True)
     parameters_json = models.JSONField(default=dict)
     requires_four_signoffs = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class TaxWorkpaper(models.Model):
@@ -244,6 +305,9 @@ class TaxWorkpaper(models.Model):
     owner = models.ForeignKey(OwnerEntity, on_delete=models.PROTECT, related_name='tax_workpapers')
     period = models.ForeignKey(AccountingPeriod, on_delete=models.PROTECT, related_name='tax_workpapers')
     tax_pack = models.ForeignKey(TaxRulePack, on_delete=models.PROTECT, related_name='workpapers')
+    entity_type_evaluated = models.CharField(max_length=24, default='Undetermined')
+    rule_pack_version = models.PositiveIntegerField(default=1)
+    evaluation_date = models.DateField(null=True, blank=True)
     gross_rent_etb = models.DecimalField(max_digits=14, decimal_places=2)
     deductible_expenses_etb = models.DecimalField(max_digits=14, decimal_places=2)
     taxable_income_books_etb = models.DecimalField(max_digits=14, decimal_places=2)

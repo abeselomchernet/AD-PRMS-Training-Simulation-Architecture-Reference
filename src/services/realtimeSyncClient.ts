@@ -2,6 +2,7 @@ export interface RealtimeSyncEvent {
   eventId: string;
   type:
     | 'payment:settled'
+    | 'sandbox:webhook:received'
     | 'maintenance:message'
     | 'maintenance:ticket'
     | 'approval:decided'
@@ -24,6 +25,7 @@ let broadcastChannel: BroadcastChannel | null = null;
 let reconnectTimer: number | null = null;
 let initialized = false;
 let connecting = false;
+let allowSocketConnection = false;
 
 export function getRealtimeClientId(): string {
   return CLIENT_ID;
@@ -46,7 +48,25 @@ function initBroadcastChannel() {
 
 import { getStoredJwtTokens, WS_BASE_URL } from './productionApiClient';
 
+export function disconnectRealtimeSocket(): void {
+  allowSocketConnection = false;
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (socket) {
+    try {
+      socket.close(1000, 'Signed out');
+    } catch {
+      // Ignore close errors
+    }
+    socket = null;
+  }
+  initialized = false;
+}
+
 async function connectSocket() {
+  if (!allowSocketConnection) return;
   if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
   if (!window.location?.host || !window.location.protocol.startsWith('http')) return;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
@@ -63,15 +83,15 @@ async function connectSocket() {
     if (WS_BASE_URL && jwt) {
       wsUrl = `${WS_BASE_URL}/ws/sync/?token=${encodeURIComponent(jwt)}`;
     } else {
-      // Only open local WS when Express /api/health confirms the backend WS hub is active
+      // Only open local WS when Express /api/office/auth/session confirms an authenticated cookie session
       if (typeof fetch === 'function') {
-        const probe = await fetch('/api/health', { cache: 'no-store' });
+        const probe = await fetch('/api/office/auth/session', { cache: 'no-store' });
         const contentType = probe.headers.get('content-type') || '';
         if (!probe.ok || !contentType.includes('application/json')) {
           return;
         }
-        const health = (await probe.json()) as { ok?: boolean; ws?: string };
-        if (!health?.ok) return;
+        const sessionProbe = (await probe.json()) as { ok?: boolean; authenticated?: boolean };
+        if (!sessionProbe?.ok || !sessionProbe?.authenticated) return;
       }
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       wsUrl = `${proto}//${window.location.host}/ws`;
@@ -105,6 +125,7 @@ async function connectSocket() {
 
     ws.onclose = () => {
       socket = null;
+      if (!allowSocketConnection) return;
       if (typeof navigator !== 'undefined' && !navigator.onLine) return;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       reconnectTimer = window.setTimeout(() => {
@@ -131,16 +152,20 @@ function dispatchToListeners(ev: RealtimeSyncEvent) {
 
 export function subscribeRealtimeEvents(handler: (ev: RealtimeSyncEvent) => void): () => void {
   listeners.add(handler);
+  allowSocketConnection = true;
   if (!initialized && typeof window !== 'undefined') {
     initialized = true;
     initBroadcastChannel();
     void connectSocket();
     window.addEventListener('online', () => {
-      void connectSocket();
+      if (allowSocketConnection) void connectSocket();
     });
   }
   return () => {
     listeners.delete(handler);
+    if (listeners.size === 0) {
+      disconnectRealtimeSocket();
+    }
   };
 }
 

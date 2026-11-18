@@ -1,5 +1,8 @@
 from decimal import Decimal, InvalidOperation
+import time
 import uuid
+from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import permissions, serializers, status, viewsets
@@ -10,6 +13,7 @@ from rest_framework.views import APIView
 from apps.billing.models import Charge
 from apps.billing.services import settle_charge_atomically
 from apps.common.permissions import (
+    AtomicRlsViewMixin,
     DenyAuditorWrites,
     IsStaffUser,
     OwnerScopedMixin,
@@ -31,11 +35,48 @@ from .models import GatewayTransaction
 class GatewayTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = GatewayTransaction
-        fields = '__all__'
+        fields = [
+            'id',
+            'tenant',
+            'unit',
+            'charge',
+            'provider',
+            'amount_etb',
+            'idempotency_nonce',
+            'external_session_id',
+            'external_reference',
+            'phone_or_account',
+            'slip_document_key',
+            'status',
+            'signature_verified',
+            'receipt',
+            'verified_by_actor_id',
+            'verified_at',
+            'created_at',
+        ]
+        read_only_fields = fields
 
 
-class GatewayInitiateView(APIView):
-    permission_classes = [DenyAuditorWrites]
+def _validate_replay_and_timestamp(provider_prefix: str, replay_key: str, raw_timestamp: object) -> tuple[bool, str]:
+    if raw_timestamp is not None and str(raw_timestamp).strip() != '':
+        try:
+            ts_val = int(float(str(raw_timestamp)))
+            if ts_val > 10**12:
+                ts_val = ts_val // 1000
+            if abs(int(time.time()) - ts_val) > 300:
+                return False, 'Webhook timestamp outside 300-second replay window.'
+        except (TypeError, ValueError):
+            return False, 'Invalid webhook timestamp header/field.'
+
+    cache_key = f'gw_replay:{provider_prefix}:{replay_key}'
+    if cache.get(cache_key):
+        return False, 'Duplicate replayed webhook ignored.'
+    cache.set(cache_key, True, timeout=900)
+    return True, ''
+
+
+class GatewayInitiateView(AtomicRlsViewMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated, DenyAuditorWrites]
     throttle_scope = 'payment_init'
 
     @transaction.atomic
@@ -47,6 +88,18 @@ class GatewayInitiateView(APIView):
                 {'detail': 'Valid charge_id and supported gateway provider are required.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        if provider in (GatewayTransaction.Provider.ARIFPAY, GatewayTransaction.Provider.TELEBIRR):
+            if not getattr(settings, 'ENABLE_LIVE_GATEWAYS', False):
+                return Response(
+                    {
+                        'detail': (
+                            'Live online payment gateways are disabled by policy '
+                            '(ENABLE_LIVE_GATEWAYS=False). Submit verified offline bank slips or enable gateways after sign-off.'
+                        )
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
 
         try:
             amount_etb = Decimal(str(request.data.get('amount_etb', '0')))
@@ -151,18 +204,47 @@ class ArifPayWebhookView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        if not getattr(settings, 'ENABLE_LIVE_GATEWAYS', False):
+            return Response(
+                {'detail': 'Live ArifPay webhooks are disabled (ENABLE_LIVE_GATEWAYS=False).'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         sig = request.headers.get('X-Arifpay-Signature', '')
         if not verify_arifpay_hmac(request.body, sig):
             return Response({'detail': 'Invalid webhook signature.'}, status=status.HTTP_403_FORBIDDEN)
 
-        nonce = str(request.data.get('nonce', ''))
-        session_id = str(request.data.get('sessionId', ''))
-        tx = GatewayTransaction.objects.select_for_update().filter(idempotency_nonce=nonce).first()
+        nonce = str(request.data.get('nonce', '')).strip()
+        session_id = str(request.data.get('sessionId', '')).strip()
+        replay_ok, replay_msg = _validate_replay_and_timestamp(
+            'arifpay',
+            f'{nonce}:{session_id}:{sig[:16]}',
+            request.headers.get('X-Arifpay-Timestamp') or request.data.get('timestamp'),
+        )
+        if not replay_ok:
+            return Response({'detail': replay_msg}, status=status.HTTP_409_CONFLICT)
+
+        tx = (
+            GatewayTransaction.objects.select_related('owner')
+            .select_for_update()
+            .filter(idempotency_nonce=nonce, provider=GatewayTransaction.Provider.ARIFPAY)
+            .first()
+        )
         if not tx:
             return Response({'detail': 'Transaction not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        bind_postgres_rls_owner(tx.owner.code)
+
         verified = fetch_arifpay_session_status(session_id or tx.external_session_id)
-        if str(verified.get('data', {}).get('status', '')).upper() == 'COMPLETED':
+        remote_data = verified.get('data', {}) or {}
+        if str(remote_data.get('status', '')).upper() == 'COMPLETED':
+            try:
+                remote_amount = Decimal(str(remote_data.get('totalAmount', tx.amount_etb)))
+            except (InvalidOperation, ValueError, TypeError):
+                return Response({'detail': 'Malformed gateway verified amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            if remote_amount != tx.amount_etb:
+                return Response({'detail': 'Verified ArifPay amount mismatch rejected.'}, status=status.HTTP_400_BAD_REQUEST)
+
             tx.signature_verified = True
             tx.raw_webhook_payload = request.data
             tx.save(update_fields=['signature_verified', 'raw_webhook_payload'])
@@ -176,19 +258,57 @@ class TelebirrWebhookView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        sig = str(request.data.get('sign', ''))
+        if not getattr(settings, 'ENABLE_LIVE_GATEWAYS', False):
+            return Response(
+                {'detail': 'Live Telebirr webhooks are disabled (ENABLE_LIVE_GATEWAYS=False).'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        sig = str(request.data.get('sign', '')).strip()
         if not verify_telebirr_rsa(request.data, sig):
             return Response({'detail': 'Invalid RSA signature.'}, status=status.HTTP_403_FORBIDDEN)
 
-        nonce = str(request.data.get('merch_order_id', ''))
-        tx = GatewayTransaction.objects.select_for_update().filter(idempotency_nonce=nonce).first()
+        nonce = str(request.data.get('merch_order_id', '')).strip()
+        payment_order_id = str(request.data.get('payment_order_id', '')).strip()
+        replay_ok, replay_msg = _validate_replay_and_timestamp(
+            'telebirr',
+            f'{nonce}:{payment_order_id}',
+            request.data.get('timestamp'),
+        )
+        if not replay_ok:
+            return Response({'detail': replay_msg}, status=status.HTTP_409_CONFLICT)
+
+        expected_merch = getattr(settings, 'TELEBIRR_MERCHANT_CODE', '') or ''
+        if expected_merch and str(request.data.get('merch_code', '')) != expected_merch:
+            return Response({'detail': 'Telebirr merchant code mismatch rejected.'}, status=status.HTTP_403_FORBIDDEN)
+
+        currency = str(request.data.get('trans_currency', 'ETB')).upper()
+        if currency != 'ETB':
+            return Response({'detail': 'Unsupported settlement currency rejected.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tx = (
+            GatewayTransaction.objects.select_related('owner')
+            .select_for_update()
+            .filter(idempotency_nonce=nonce, provider=GatewayTransaction.Provider.TELEBIRR)
+            .first()
+        )
         if not tx:
             return Response({'detail': 'Transaction not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        bind_postgres_rls_owner(tx.owner.code)
+
+        if 'total_amount' in request.data:
+            try:
+                paid_amount = Decimal(str(request.data.get('total_amount')))
+            except (InvalidOperation, ValueError, TypeError):
+                return Response({'detail': 'Invalid Telebirr total_amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            if paid_amount != tx.amount_etb:
+                return Response({'detail': 'Telebirr webhook amount mismatch rejected.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if str(request.data.get('trade_status', '')).upper() in ('COMPLETED', 'SUCCESS'):
             tx.signature_verified = True
             tx.raw_webhook_payload = request.data
-            tx.external_reference = str(request.data.get('payment_order_id', tx.external_reference))
+            tx.external_reference = payment_order_id or tx.external_reference
             tx.save(update_fields=['signature_verified', 'raw_webhook_payload', 'external_reference'])
             _finalize_gateway_tx(tx, actor_id='WEBHOOK-TELEBIRR')
 
@@ -198,12 +318,16 @@ class TelebirrWebhookView(APIView):
 class GatewayTransactionViewSet(OwnerScopedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = GatewayTransaction.objects.select_related('owner', 'tenant', 'charge', 'receipt').all()
     serializer_class = GatewayTransactionSerializer
-    permission_classes = [DenyAuditorWrites]
-    tenant_field = 'tenant_id'
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
 
-    @action(detail=True, methods=['post'], permission_classes=[IsStaffUser, DenyAuditorWrites])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites])
     @transaction.atomic
     def verify_slip(self, request, pk=None):
         tx = self.get_object()
+        if tx.provider != GatewayTransaction.Provider.CBE_SLIP:
+            return Response(
+                {'detail': 'Manual verify_slip is restricted to offline CBE Transfer Slip transactions.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         _finalize_gateway_tx(tx, actor_id=request.user.actor_id)
         return Response({'status': tx.status, 'receipt_id': str(tx.receipt_id)})

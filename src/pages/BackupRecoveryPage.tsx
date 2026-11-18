@@ -64,6 +64,23 @@ export const BackupRecoveryPage: React.FC = () => {
         }
       />
 
+      <section className="rounded-xl border border-[#DFE5EE] dark:border-[#233349] bg-[#F8FAFC] dark:bg-[#152236] px-5 py-3.5 text-xs text-slate-700 dark:text-slate-300 space-y-1">
+        <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+          {biText(
+            locale,
+            'Complete Production Recovery Set & Reconciled Restore Verification',
+            'የምርት ስርዓት ሙሉ የመልሶ ማግኛ ስብስብ እና የሂሳብ ማረጋገጫ'
+          )}
+        </p>
+        <p>
+          {biText(
+            locale,
+            'Production disaster recovery pairs encrypted PostgreSQL snapshots with encrypted document/object-storage archives, JSON integrity manifests (recording key IDs without embedding secrets), and automated post-restore reconciliation of Trial Balance, DepositMovement subledger, GL 2120, document hashes, and SHA-256 audit chains.',
+            'በምርት ስርዓቱ ውስጥ የተመሰጠሩ የPostgreSQL ምትኬዎች፣ የተመሰጠሩ የሰነድ ክምችቶች፣ ሚስጥራዊ ቁልፎችን የማይይዙ የማኒፌስት መዝገቦች እና ከመልሶ ማግኛ በኋላ የTrial Balance እና የኦዲት ሰንሰለት ማረጋገጫ በጋራ ይሰራሉ።'
+          )}
+        </p>
+      </section>
+
       {/* Unapproved RPO / RTO Draft Policies */}
       <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {ownerBackupPolicies.map((pol) => (

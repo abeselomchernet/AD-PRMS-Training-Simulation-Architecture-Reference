@@ -9,6 +9,7 @@ def health_check(_request):
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('prod/', include('apps.portfolio.ui_urls')),
     path('api/v1/health/', health_check, name='api-health'),
     path('api/v1/auth/', include('apps.accounts.urls')),
     path('api/v1/portfolio/', include('apps.portfolio.urls')),

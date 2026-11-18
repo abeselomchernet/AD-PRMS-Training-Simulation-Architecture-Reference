@@ -1,10 +1,16 @@
-from rest_framework import viewsets
-from apps.common.permissions import DenyAuditorWrites, IsStaffUser, OwnerScopedMixin
-from .models import Building, Lease, OwnerEntity, Property, TenantProfile, Unit
+from rest_framework import permissions, viewsets
+from apps.common.permissions import (
+    DenyAuditorWrites,
+    IsStaffOrTenantSelfReadOnly,
+    IsStaffUser,
+    OwnerScopedMixin,
+)
+from .models import Building, Lease, OwnerEntity, PartyIdentity, Property, TenantProfile, Unit
 from .serializers import (
     BuildingSerializer,
     LeaseSerializer,
     OwnerEntitySerializer,
+    PartyIdentitySerializer,
     PropertySerializer,
     TenantProfileSerializer,
     UnitSerializer,
@@ -14,19 +20,43 @@ from .serializers import (
 class PropertyViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
     queryset = Property.objects.select_related('owner').all()
     serializer_class = PropertySerializer
-    permission_classes = [IsStaffUser, DenyAuditorWrites]
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
 
 
 class BuildingViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
     queryset = Building.objects.select_related('owner', 'property_ref').all()
     serializer_class = BuildingSerializer
-    permission_classes = [IsStaffUser, DenyAuditorWrites]
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
+
+
+class PartyIdentityViewSet(OwnerScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = PartyIdentity.objects.select_related('owner').all()
+    serializer_class = PartyIdentitySerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser]
 
 
 class UnitViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
     queryset = Unit.objects.select_related('owner', 'property_ref', 'building').all()
     serializer_class = UnitSerializer
-    permission_classes = [DenyAuditorWrites]
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
+
+
+class TenantProfileViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
+    queryset = TenantProfile.objects.select_related('owner').all()
+    serializer_class = TenantProfileSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
+
+
+class LeaseViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
+    queryset = Lease.objects.select_related('owner', 'unit', 'tenant').all()
+    serializer_class = LeaseSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser, DenyAuditorWrites]
+
+
+class TenantMyUnitViewSet(OwnerScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = Unit.objects.select_related('owner', 'property_ref', 'building').all()
+    serializer_class = UnitSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffOrTenantSelfReadOnly]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -35,23 +65,24 @@ class UnitViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
         return qs
 
 
-class TenantProfileViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
+class TenantMyProfileViewSet(OwnerScopedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = TenantProfile.objects.select_related('owner').all()
     serializer_class = TenantProfileSerializer
-    permission_classes = [DenyAuditorWrites]
+    permission_classes = [permissions.IsAuthenticated, IsStaffOrTenantSelfReadOnly]
     tenant_field = 'id'
 
 
-class LeaseViewSet(OwnerScopedMixin, viewsets.ModelViewSet):
+class TenantMyLeaseViewSet(OwnerScopedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = Lease.objects.select_related('owner', 'unit', 'tenant').all()
     serializer_class = LeaseSerializer
-    permission_classes = [DenyAuditorWrites]
+    permission_classes = [permissions.IsAuthenticated, IsStaffOrTenantSelfReadOnly]
     tenant_field = 'tenant_id'
 
 
 class OwnerViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = OwnerEntity.objects.all()
     serializer_class = OwnerEntitySerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffUser]
 
     def get_queryset(self):
         allowed = list(getattr(self.request.user, 'allowed_owners', []) or [])

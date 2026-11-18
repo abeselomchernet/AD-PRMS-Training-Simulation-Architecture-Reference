@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 from .views import (
     AccountingPeriodViewSet,
+    DepositMovementViewSet,
     JournalEntryViewSet,
     LedgerAccountViewSet,
     PeriodCloseApiView,
@@ -16,6 +17,7 @@ router = DefaultRouter()
 router.register('accounts', LedgerAccountViewSet, basename='ledger-accounts')
 router.register('periods', AccountingPeriodViewSet, basename='accounting-periods')
 router.register('journals', JournalEntryViewSet, basename='journal-entries')
+router.register('deposits/movements', DepositMovementViewSet, basename='deposit-movements')
 
 urlpatterns = [
     path('', include(router.urls)),

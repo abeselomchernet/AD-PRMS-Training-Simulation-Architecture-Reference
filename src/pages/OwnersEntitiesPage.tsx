@@ -53,6 +53,23 @@ export const OwnersEntitiesPage: React.FC = () => {
         }
       />
 
+      <div className="rounded-xl border border-[#DFE5EE] dark:border-[#233349] bg-[#F8FAFC] dark:bg-[#152236] px-5 py-3.5 text-xs text-slate-700 dark:text-slate-300 space-y-1">
+        <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+          {biText(
+            locale,
+            'Training Multi-Owner Fixtures vs. Authoritative Production Portfolio Topology',
+            'የልምምድ ባለብዙ-ባለቤት መረጃ እና የምርት ስሪት ትክክለኛ የባለቤትነት መዋቅር'
+          )}
+        </p>
+        <p>
+          {biText(
+            locale,
+            'OWN-ALPHA / OWN-BETA in this simulator exist strictly to demonstrate RLS owner isolation. In the authoritative Django production portfolio, Registered Title-Holder Abdulwehab Dekebo holds all 5 buildings (~20 units each, Provisional unit count until deed verification), while Abdulwehab Dekebo Trading is modeled separately as a Pending Documentary Confirmation PartyIdentity with inter-entity postings disabled.',
+            'በዚህ ማስመሰያ ውስጥ ያሉት OWN-ALPHA እና OWN-BETA የRLS መለያ ገደብን ለማሳየት የተዘጋጁ ሰው-ሠራሽ መረጃዎች ናቸው። በምርት ስርዓቱ ውስጥ አብዱልወሃብ ደከቦ አምስቱንም ሕንፃዎች (እያንዳንዳቸው ~20 ክፍሎች፣ በሰነድ እስኪረጋገጥ ጊዜያዊ) በባለቤትነት የያዘ ሲሆን፣ አብዱልወሃብ ደከቦ ትሬዲንግ ሰነድ እስኪረጋገጥ በተናጠል ተመዝግቦ የተቋማት መሃል የሂሳብ ዝውውር ታግዷል።'
+          )}
+        </p>
+      </div>
+
       {/* Active Owner Record Table (Single-owner isolated list) */}
       <section className="bg-white dark:bg-[#111C2C] border border-[#DFE5EE] dark:border-[#233349] rounded-xl overflow-hidden">
         <div className="px-5 py-3.5 border-b border-[#DFE5EE] dark:border-[#233349] bg-[#F8FAFC] dark:bg-[#152236] flex items-center justify-between gap-2">

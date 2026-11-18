@@ -2,6 +2,7 @@ from django.db import migrations
 
 
 OWNER_SCOPED_TABLES = [
+    'portfolio_partyidentity',
     'portfolio_property',
     'portfolio_building',
     'portfolio_unit',
@@ -25,7 +26,7 @@ def apply_wp2_postgres(apps, schema_editor):
         return
 
     with schema_editor.connection.cursor() as cursor:
-        # 1. Attach audit immutability triggers to governance_auditevent (ADD-AUD-003)
+        # 1. Attach audit immutability triggers & privilege revocation on governance_auditevent
         cursor.execute("""
             DO $$
             BEGIN
@@ -39,6 +40,10 @@ def apply_wp2_postgres(apps, schema_editor):
                     CREATE TRIGGER trg_prevent_audit_truncate
                         BEFORE TRUNCATE ON governance_auditevent
                         FOR EACH STATEMENT EXECUTE FUNCTION prevent_audit_mutation();
+
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'adprms_app') THEN
+                        REVOKE UPDATE, DELETE, TRUNCATE ON TABLE governance_auditevent FROM adprms_app;
+                    END IF;
                 END IF;
             END $$;
         """)
@@ -52,6 +57,14 @@ def apply_wp2_postgres(apps, schema_editor):
                 checker_actor text;
             BEGIN
                 IF NEW.status IN ('Approved', 'Rejected', 'Returned') THEN
+                    IF NEW.status = 'Approved' AND (
+                        NEW.approved_checker_actor_id IS NULL
+                        OR NEW.approved_checker_actor_id = ''
+                        OR NEW.approved_checker_actor_id = NEW.maker_actor_id
+                    ) THEN
+                        RAISE EXCEPTION 'Maker-Checker SoD violation: approved_checker_actor_id "%" cannot finalize request %',
+                            COALESCE(NEW.approved_checker_actor_id, ''), NEW.request_number;
+                    END IF;
                     IF jsonb_typeof(NEW.decision_log::jsonb) = 'array'
                        AND jsonb_array_length(NEW.decision_log::jsonb) > 0 THEN
                         last_entry := (NEW.decision_log::jsonb) -> (jsonb_array_length(NEW.decision_log::jsonb) - 1);
@@ -131,7 +144,12 @@ def reverse_wp2_postgres(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('governance', '0001_audit_immutability'),
+        ('governance', '0002_audit_immutability'),
+        ('portfolio', '0002_cross_owner_triggers'),
+        ('billing', '0001_initial'),
+        ('gateways', '0001_initial'),
+        ('documents', '0001_initial'),
+        ('maintenance', '0001_initial'),
     ]
 
     operations = [

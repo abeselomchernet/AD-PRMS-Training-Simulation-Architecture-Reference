@@ -275,5 +275,45 @@ test.describe('AD-PRMS End-to-End Governance, Isolation & UI Flows', () => {
 
     expect(pageErrors).toEqual([]);
   });
+
+  test('Unauthenticated /api/office barrier (401) and Internet-Down vs Server-Down Offline/LAN modes (#9, #14)', async ({
+    page,
+  }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', (err) => pageErrors.push(err.message));
+
+    // 1. Unauthenticated /api/office/state & /api/office/ledger/accounts must return 401
+    const unauthState = await page.request.get('/api/office/state');
+    expect(unauthState.status()).toBe(401);
+    const unauthLedger = await page.request.get('/api/office/ledger/accounts?ownerId=OWN-ALPHA');
+    expect(unauthLedger.status()).toBe(401);
+
+    // 2. Scenario A: Internet Unavailable (external payment endpoints blocked), Local LAN Server Reachable
+    await page.route('**://*.arifpay.*/**', (route) => route.abort('failed'));
+    await page.route('**://*.ethiotelebirr.*/**', (route) => route.abort('failed'));
+    await signInAs(page, 'finance.demo');
+
+    const localSessionRes = await page.request.get('/api/office/auth/session');
+    expect(localSessionRes.ok()).toBe(true);
+    expect((await localSessionRes.json()).authenticated).toBe(true);
+
+    await page.getByRole('button', { name: 'Finance', exact: true }).click();
+    await page.getByRole('button', { name: /Journals & Rules/i }).click();
+    await expect(page.getByRole('heading', { name: /Append-Only Double-Entry Ledger/i })).toBeVisible();
+
+    // 3. Scenario B: Office Server Unavailable (aborted /api/office/state) keeps app responsive without crashing
+    await page.route('**/api/office/state**', (route) => route.abort('connectionrefused'));
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+
+    await expect(page.getByText(/Offline — showing cached data/i)).toBeVisible();
+    await page.getByRole('button', { name: /Governance & Controls/i }).click();
+    await page.getByRole('button', { name: 'Compliance Readiness', exact: true }).click();
+    await expect(page.getByRole('heading', { name: /Compliance Readiness/i })).toBeVisible();
+
+    await page.unroute('**/api/office/state**');
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+
+    expect(pageErrors).toEqual([]);
+  });
 });
 

@@ -24,7 +24,7 @@ class Charge(models.Model):
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.OPEN)
 
     class Meta:
-        indexes = [models.Index(fields=['owner', 'tenant', 'status'])]
+        indexes = [models.Index(fields=['owner', 'tenant', 'status'], name='bill_chg_own_ten_stat_idx')]
 
 
 class PaymentReceipt(models.Model):

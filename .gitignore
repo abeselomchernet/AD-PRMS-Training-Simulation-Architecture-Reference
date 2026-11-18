@@ -13,3 +13,4 @@ test-results/
 .data/
 __pycache__/
 *.pyc
+ci-reports/

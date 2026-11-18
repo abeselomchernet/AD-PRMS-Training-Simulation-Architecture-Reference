@@ -42,7 +42,7 @@ class OtpChallenge(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=['msisdn', '-created_at'])]
+        indexes = [models.Index(fields=['msisdn', '-created_at'], name='acct_otp_msisdn_created_idx')]
 
     @property
     def is_expired(self) -> bool:

@@ -123,9 +123,9 @@ def main() -> int:
             cur.execute(
                 """
                 INSERT INTO governance_approvalrequest
-                    (id, owner_id, request_number, category, title, target_record_type, target_record_id, maker_actor_id, maker_role, workflow_mode, current_step, total_steps, status, finalized, before_values, after_values, decision_log, created_at)
+                    (id, owner_id, request_number, category, title, target_record_type, target_record_id, maker_actor_id, maker_role, workflow_mode, current_step, total_steps, status, finalized, before_values, after_values, payload_json, payload_hash, approved_checker_actor_id, decision_log, created_at)
                 VALUES
-                    (%s, %s, %s, 'Finance', 'WP2 Test', 'Unit', 'U-1', 'ACT-MAKER', 'Finance Officer', 'Two-Step', 1, 2, 'Pending', false, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb, NOW())
+                    (%s, %s, %s, 'Finance', 'WP2 Test', 'Unit', 'U-1', 'ACT-MAKER', 'Finance Officer', 'Two-Step', 1, 2, 'Pending', false, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '', '', '[]'::jsonb, NOW())
                 """,
                 (apr_id, owner_a, f'REQ-WP2-{apr_id[:6]}'),
             )
@@ -135,7 +135,7 @@ def main() -> int:
                 cur.execute(
                     """
                     UPDATE governance_approvalrequest
-                    SET status = 'Approved', finalized = true, decision_log = '[{"actor_id":"ACT-MAKER","action":"Approved"}]'::jsonb
+                    SET status = 'Approved', finalized = true, approved_checker_actor_id = 'ACT-MAKER', decision_log = '[{"actor_id":"ACT-MAKER","action":"Approved"}]'::jsonb
                     WHERE id = %s
                     """,
                     (apr_id,),
@@ -149,12 +149,68 @@ def main() -> int:
             cur.execute(
                 """
                 UPDATE governance_approvalrequest
-                SET status = 'Approved', finalized = true, decision_log = '[{"actor_id":"ACT-CHECKER","action":"Approved"}]'::jsonb
+                SET status = 'Approved', finalized = true, approved_checker_actor_id = 'ACT-CHECKER', decision_log = '[{"actor_id":"ACT-CHECKER","action":"Approved"}]'::jsonb
                 WHERE id = %s
                 """,
                 (apr_id,),
             )
             print('[PASS] 5.2 Independent Checker approval allowed')
+
+            # Test 6.1: DepositMovement append-only & RLS
+            bldg_id = str(uuid.uuid4())
+            unit_id = str(uuid.uuid4())
+            ten_id = str(uuid.uuid4())
+            lease_id = str(uuid.uuid4())
+            dep_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO portfolio_building (id, owner_id, property_ref_id, code, name, floors, total_units_expected, unit_count_status, deed_reference, address_note, status)
+                VALUES (%s, %s, %s, 'WP2-B1', 'WP2 Building 1', 2, 20, 'Provisional', '', '', 'Active')
+                """,
+                (bldg_id, owner_a, prop_a),
+            )
+            cur.execute(
+                """
+                INSERT INTO portfolio_unit (id, owner_id, property_ref_id, building_id, code, name, floor, area_sqm, unit_type, status, base_rent_etb, previous_identifiers)
+                VALUES (%s, %s, %s, %s, 'U-101', 'Unit 101', 1, 50.00, 'Shop', 'Occupied', 10000.00, '[]'::jsonb)
+                """,
+                (unit_id, owner_a, prop_a, bldg_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO portfolio_tenantprofile (id, owner_id, code, name, business_type, phone_msisdn, email, emergency_contact, id_number_encrypted, status)
+                VALUES (%s, %s, 'TEN-WP2', 'WP2 Tenant', 'Retail', '+251911000999', '', '', '', 'Active')
+                """,
+                (ten_id, owner_a),
+            )
+            cur.execute(
+                """
+                INSERT INTO portfolio_lease (id, owner_id, lease_number, version, unit_id, tenant_id, status, start_date, end_date, monthly_rent_etb, security_deposit_etb, billing_cycle, notes, created_at)
+                VALUES (%s, %s, 'L-WP2-1', 1, %s, %s, 'Active', CURRENT_DATE, CURRENT_DATE + 365, 10000.00, 10000.00, 'Monthly', '', NOW())
+                """,
+                (lease_id, owner_a, unit_id, ten_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO ledger_depositmovement (id, owner_id, tenant_id, lease_id, movement_type, signed_amount_etb, effective_date, reference, maker_actor_id, notes, created_at)
+                VALUES (%s, %s, %s, %s, 'Receipt', 10000.00, CURRENT_DATE, 'DEP-WP2-1', 'ACT-FIN', '', NOW())
+                """,
+                (dep_id, owner_a, ten_id, lease_id),
+            )
+            cur.execute('SAVEPOINT sp_dep_mut')
+            dep_blocked = False
+            try:
+                cur.execute("UPDATE ledger_depositmovement SET signed_amount_etb = 0.00 WHERE id = %s", (dep_id,))
+            except Exception:
+                dep_blocked = True
+                cur.execute('ROLLBACK TO SAVEPOINT sp_dep_mut')
+            assert dep_blocked, 'DepositMovement mutation was NOT blocked by trigger!'
+            print('[PASS] 6.1 DepositMovement append-only trigger enforced')
+
+            cur.execute("SELECT set_config('app.current_owner_id', %s, true)", (owner_b,))
+            cur.execute("SELECT COUNT(*) FROM ledger_depositmovement WHERE id = %s", (dep_id,))
+            assert cur.fetchone()[0] == 0, 'DepositMovement cross-owner RLS leak detected!'
+            print('[PASS] 6.2 DepositMovement cross-owner RLS isolation enforced')
     finally:
         conn.rollback()
         conn.close()

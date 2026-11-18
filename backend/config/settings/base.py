@@ -54,7 +54,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -214,8 +214,9 @@ SMS_PROVIDER = os.environ.get('SMS_PROVIDER', 'sandbox').lower()
 SMS_API_KEY = os.environ.get('SMS_API_KEY', '')
 SMS_SENDER_ID = os.environ.get('SMS_SENDER_ID', 'ADPRMS')
 
-# Fiscal Tax Guardrail (Locked until ERCA + Licensed Tax Adviser Sign-off)
+# Fiscal Tax & Live Gateway Guardrails (Disabled by default until adviser sign-off & verified production credentials)
 ENABLE_LIVE_TAX_INVOICING = os.environ.get('ENABLE_LIVE_TAX_INVOICING', 'False').lower() == 'true'
+ENABLE_LIVE_GATEWAYS = os.environ.get('ENABLE_LIVE_GATEWAYS', 'False').lower() == 'true'
 
 FIELD_ENCRYPTION_KEY = os.environ.get('FIELD_ENCRYPTION_KEY', '')
 

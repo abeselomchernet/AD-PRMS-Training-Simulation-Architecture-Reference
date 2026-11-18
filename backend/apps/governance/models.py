@@ -23,14 +23,44 @@ class ApprovalRequest(models.Model):
     finalized = models.BooleanField(default=False)
     before_values = models.JSONField(default=dict)
     after_values = models.JSONField(default=dict)
+    payload_json = models.JSONField(default=dict, blank=True)
+    payload_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    approved_checker_actor_id = models.CharField(max_length=64, blank=True)
     decision_log = models.JSONField(default=list)
     due_date = models.DateField(null=True, blank=True)
     expiry_date = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    @staticmethod
+    def compute_payload_hash(payload: dict | None) -> str:
+        canonical = json.dumps(payload or {}, sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
     def assert_checker_sod(self, checker_actor_id: str) -> None:
         if not checker_actor_id or checker_actor_id == self.maker_actor_id:
             raise ValidationError('Maker-Checker SoD violation: maker cannot approve, reject, or return their own request.')
+
+    def verify_approved_for_execution(self, expected_payload: dict | None = None) -> str:
+        if self.status != 'Approved' or not self.finalized:
+            raise ValidationError(f'ApprovalRequest {self.request_number} is not finalized/Approved.')
+        checker_actor = self.approved_checker_actor_id
+        if not checker_actor or checker_actor == self.maker_actor_id:
+            raise ValidationError('Maker-Checker SoD violation: approved_checker_actor_id is missing or matches maker.')
+        if not self.decision_log:
+            raise ValidationError('ApprovalRequest is missing a recorded decision_log entry.')
+        last_decision = self.decision_log[-1]
+        if (
+            last_decision.get('action') != 'Approved'
+            or not last_decision.get('actor_id')
+            or last_decision.get('actor_id') == self.maker_actor_id
+            or last_decision.get('actor_id') != checker_actor
+        ):
+            raise ValidationError('ApprovalRequest decision_log does not verify an independent checker approval.')
+        if expected_payload is not None and self.payload_hash:
+            expected_hash = self.compute_payload_hash(expected_payload)
+            if expected_hash != self.payload_hash:
+                raise ValidationError('Approval payload integrity violation: execution payload does not match approved payload_hash.')
+        return checker_actor
 
 
 class ErcaVerificationGate(models.Model):
@@ -142,7 +172,13 @@ class AuditEvent(models.Model):
 
 class BackupSnapshotRecord(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner_code = models.CharField(max_length=32, default='GLOBAL', db_index=True)
     snapshot_key = models.CharField(max_length=255)
     sha256_checksum = models.CharField(max_length=64)
+    documents_checksum = models.CharField(max_length=64, blank=True)
+    encryption_key_id = models.CharField(max_length=128, blank=True)
+    app_version = models.CharField(max_length=64, blank=True)
+    manifest_json = models.JSONField(default=dict, blank=True)
+    reconciliation_passed = models.BooleanField(default=False)
     status = models.CharField(max_length=32, default='Verified')
     created_at = models.DateTimeField(auto_now_add=True)

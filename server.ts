@@ -1,64 +1,113 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   type ArifPayServerSession,
   OfficeSqliteStore,
   type SyncEventPayload,
 } from './server/officeStore.ts';
+import {
+  authenticateOfficeCredential,
+  buildClaimsFromDirectory,
+  extractOfficeSessionFromHeaders,
+  findDirectoryEntryByUsername,
+  OFFICE_SESSION_COOKIE_NAME,
+  type OfficeSessionClaims,
+  resolveBindHost,
+  resolveListenPort,
+  signOfficeSessionToken,
+  verifyArifPayWebhookSignature,
+  verifyTelebirrWebhookSignature,
+} from './server/security.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+interface AuthedRequest extends Request {
+  officeSession?: OfficeSessionClaims;
+  rawBody?: string;
+}
+
+const PORT = resolveListenPort();
+const BIND_HOST = resolveBindHost();
 const isProduction = process.env.NODE_ENV === 'production';
 
-function verifyOptionalArifPaySignature(rawBody: string, signatureHeader: string): boolean {
-  const secret = process.env.ARIFPAY_WEBHOOK_SECRET || '';
-  if (!secret) return true;
-  if (!signatureHeader) return false;
-  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureHeader.trim()));
-  } catch {
-    return false;
+// In-memory replay guard scoped to server process lifetime (complemented by SQLite/Django idempotency)
+const seenWebhookReplayKeys = new Set<string>();
+
+function appendSessionCookie(res: Response, req: Request, token: string): void {
+  const isHttps =
+    req.secure || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+  const parts = [
+    `${OFFICE_SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${4 * 60 * 60}`,
+  ];
+  if (isHttps) {
+    parts.push('Secure');
   }
+  res.setHeader('Set-Cookie', parts.join('; '));
 }
 
-function verifyOptionalTelebirrSignature(payload: Record<string, unknown>): boolean {
-  const publicKeyPem = process.env.TELEBIRR_PUBLIC_KEY_PEM || '';
-  if (!publicKeyPem) return true;
-  const sig = String(payload.sign || '');
-  if (!sig) return false;
-  const canonical = Object.keys(payload)
-    .filter((k) => payload[k] !== undefined && payload[k] !== null && payload[k] !== '' && k !== 'sign' && k !== 'sign_type')
-    .sort()
-    .map((k) => `${k}=${payload[k]}`)
-    .join('&');
-  try {
-    const verifier = crypto.createVerify('RSA-SHA256');
-    verifier.update(canonical);
-    return verifier.verify(publicKeyPem, sig, 'base64');
-  } catch {
-    return false;
-  }
+function clearSessionCookie(res: Response): void {
+  res.setHeader(
+    'Set-Cookie',
+    `${OFFICE_SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+  );
 }
 
-async function startServer() {
+function requireOfficeAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
+  const claims = extractOfficeSessionFromHeaders(req.headers);
+  if (!claims) {
+    res.status(401).json({
+      error: true,
+      msg: 'Authentication required for AD-PRMS Training Server endpoints.',
+    });
+    return;
+  }
+  req.officeSession = claims;
+  next();
+}
+
+function isOwnerAllowed(claims: OfficeSessionClaims, ownerId: string): boolean {
+  return claims.allowedOwners.includes(ownerId);
+}
+
+function canMutateStaffLedgerOrState(claims: OfficeSessionClaims): boolean {
+  if (claims.sessionType !== 'staff') return false;
+  if (claims.role === 'Auditor / Read-only reviewer') return false;
+  return true;
+}
+
+export async function createTrainingServerApp(options?: {
+  dataDir?: string;
+  dbPath?: string;
+  attachVite?: boolean;
+}) {
   const store = new OfficeSqliteStore(
-    path.resolve(import.meta.dirname, '.data'),
-    process.env.OFFICE_DB_PATH
+    options?.dataDir || path.resolve(import.meta.dirname, '.data'),
+    options?.dbPath ?? process.env.OFFICE_DB_PATH
   );
 
   const app = express();
 
-  // Raw binary route for local evidence uploads (before express.json)
+  app.use((_req, res, next) => {
+    res.setHeader('X-ADPRMS-Mode', 'TRAINING-SYNTHETIC-ONLY');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    next();
+  });
+
+  // Raw binary route for local evidence uploads (authenticated before reading/writing disk)
   app.post(
     '/api/office/uploads',
+    requireOfficeAuth,
     express.raw({
       type: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
       limit: '11mb',
     }),
-    (req, res) => {
+    (req: AuthedRequest, res: Response) => {
+      const claims = req.officeSession!;
       const mimeType = String(req.headers['content-type'] || '').split(';')[0].trim();
       const rawName = String(req.headers['x-file-name'] || 'evidence');
       let filename = 'evidence';
@@ -67,7 +116,15 @@ async function startServer() {
       } catch {
         filename = rawName;
       }
-      const ownerId = String(req.headers['x-owner-id'] || 'OWN-ALPHA');
+      const ownerId = String(req.headers['x-owner-id'] || claims.defaultOwnerId);
+      if (!isOwnerAllowed(claims, ownerId)) {
+        res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+        return;
+      }
+      if (claims.role === 'Auditor / Read-only reviewer') {
+        res.status(403).json({ error: true, msg: 'Auditor role is strictly read-only.' });
+        return;
+      }
       const entityType = String(req.headers['x-entity-type'] || 'GENERAL');
       const entityRefId = String(req.headers['x-entity-ref-id'] || '');
 
@@ -104,15 +161,29 @@ async function startServer() {
     }
   );
 
-  app.use(express.json({ limit: '15mb' }));
+  app.use(
+    express.json({
+      limit: '15mb',
+      verify: (req, _res, buf) => {
+        (req as AuthedRequest).rawBody = buf.toString('utf8');
+      },
+    })
+  );
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (req, socket, head) => {
-    const pathname = new URL(req.url || '/', 'http://localhost').pathname;
+    const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
     if (pathname === '/ws') {
+      const claims = extractOfficeSessionFromHeaders(req.headers);
+      if (!claims) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        (ws as WebSocket & { officeSession?: OfficeSessionClaims }).officeSession = claims;
         wss.emit('connection', ws, req);
       });
     }
@@ -124,19 +195,29 @@ async function startServer() {
 
     const encoded = JSON.stringify({ kind: 'sync:event', event });
     wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
+      const clientClaims = (client as WebSocket & { officeSession?: OfficeSessionClaims }).officeSession;
+      if (
+        client.readyState === WebSocket.OPEN &&
+        clientClaims &&
+        isOwnerAllowed(clientClaims, event.ownerId)
+      ) {
         client.send(encoded);
       }
     });
   };
 
   wss.on('connection', (ws) => {
+    const clientClaims = (ws as WebSocket & { officeSession?: OfficeSessionClaims }).officeSession;
+    const recentEvents = store
+      .getRecentSyncEvents(20)
+      .filter((ev) => (clientClaims ? isOwnerAllowed(clientClaims, ev.ownerId) : false));
+
     ws.send(
       JSON.stringify({
         kind: 'sync:hello',
         serverTime: new Date().toISOString(),
         connectedClients: wss.clients.size,
-        recentEvents: store.getRecentSyncEvents(20),
+        recentEvents,
       })
     );
 
@@ -147,6 +228,9 @@ async function startServer() {
           event?: SyncEventPayload;
         };
         if (parsed.kind === 'sync:publish' && parsed.event && parsed.event.eventId) {
+          if (clientClaims && !isOwnerAllowed(clientClaims, parsed.event.ownerId)) {
+            return;
+          }
           broadcastSyncEvent(parsed.event);
           ws.send(JSON.stringify({ kind: 'sync:ack', eventId: parsed.event.eventId }));
         }
@@ -157,35 +241,91 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
-    const wsState = store.getWorkspaceState();
     res.json({
       ok: true,
-      mode: 'AD-PRMS Office Test & Training Server (SQLite)',
+      mode: 'TRAINING-SYNTHETIC-ONLY',
+      runtime: 'AD-PRMS Training & Office Simulator (SQLite)',
+      bindHost: BIND_HOST,
+      loopbackDefault: true,
+      authRequired: true,
       sqlite: true,
-      revision: wsState.revision,
-      uploadsCount: store.getUploadsCount(),
-      pushSubscribers: store.getPushSubscribersCount(),
-      connectedClients: wss.clients.size,
       timestamp: new Date().toISOString(),
     });
   });
 
   // --------------------------------------------------------------------------
-  // Persistent Office SQLite State API
+  // Training Server Session Authentication (HttpOnly Signed Cookie)
   // --------------------------------------------------------------------------
-  app.get('/api/office/state', (_req, res) => {
+  app.get('/api/office/auth/session', (req, res) => {
+    const claims = extractOfficeSessionFromHeaders(req.headers);
+    if (!claims) {
+      res.status(200).json({ ok: true, authenticated: false, session: null });
+      return;
+    }
+    res.status(200).json({ ok: true, authenticated: true, session: claims });
+  });
+
+  app.post('/api/office/auth/login', (req, res) => {
+    const body = (req.body || {}) as { username?: string; password?: string };
+    const matched = authenticateOfficeCredential(
+      String(body.username || ''),
+      String(body.password || '')
+    );
+    if (!matched) {
+      res.status(401).json({
+        error: true,
+        msg: 'Invalid training simulator username or password.',
+      });
+      return;
+    }
+    const claims = buildClaimsFromDirectory(matched);
+    const token = signOfficeSessionToken(claims);
+    appendSessionCookie(res, req, token);
+    res.status(200).json({
+      ok: true,
+      authenticated: true,
+      session: claims,
+    });
+  });
+
+  app.post('/api/office/auth/logout', (_req, res) => {
+    clearSessionCookie(res);
+    res.status(200).json({ ok: true, authenticated: false });
+  });
+
+  // --------------------------------------------------------------------------
+  // Persistent Office SQLite State API (Authenticated & Server-Role Authorized)
+  // --------------------------------------------------------------------------
+  app.get('/api/office/state', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (claims.sessionType !== 'staff') {
+      res.status(403).json({ error: true, msg: 'Workspace state retrieval is restricted to staff training sessions.' });
+      return;
+    }
     res.json(store.getWorkspaceState());
   });
 
-  app.put('/api/office/state', (req, res) => {
+  app.put('/api/office/state', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({
+        error: true,
+        msg: `Role "${claims.role}" is read-only and cannot modify SQLite workspace state.`,
+      });
+      return;
+    }
     const body = (req.body || {}) as {
       state?: Record<string, unknown>;
-      updatedBy?: string;
       onlyIfUninitialized?: boolean;
       expectedRevision?: number;
       originClientId?: string;
       ownerId?: string;
     };
+    const requestedOwner = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, requestedOwner)) {
+      res.status(403).json({ error: true, msg: `Forbidden cross-owner state write (${requestedOwner}).` });
+      return;
+    }
     if (!body.state || typeof body.state !== 'object') {
       res.status(400).json({ error: true, msg: 'Valid state object is required.' });
       return;
@@ -193,7 +333,7 @@ async function startServer() {
 
     const saved = store.saveWorkspaceState(
       body.state,
-      String(body.updatedBy || 'office-client'),
+      claims.username,
       Boolean(body.onlyIfUninitialized),
       typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined
     );
@@ -213,10 +353,10 @@ async function startServer() {
       broadcastSyncEvent({
         eventId: `EVT-STATE-${saved.revision}-${Date.now()}`,
         type: 'state:synced',
-        ownerId: String(body.ownerId || 'OWN-ALPHA'),
+        ownerId: requestedOwner,
         originClientId: body.originClientId,
         timestamp: saved.updatedAt,
-        data: { revision: saved.revision, updatedBy: body.updatedBy || 'office-client' },
+        data: { revision: saved.revision, updatedBy: claims.username },
       });
     }
 
@@ -228,55 +368,72 @@ async function startServer() {
     });
   });
 
-  app.post('/api/office/reset', (req, res) => {
+  app.post('/api/office/reset', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    // Derive trainer authority strictly from verified server session cookie — never request headers or body.
+    if (claims.role !== 'Training Coordinator' || !claims.isTrainer) {
+      res.status(403).json({
+        error: true,
+        msg: 'Seed reset is restricted to authenticated Training Coordinator sessions.',
+      });
+      return;
+    }
     const body = (req.body || {}) as {
       state?: Record<string, unknown>;
-      resetBy?: string;
       originClientId?: string;
       ownerId?: string;
     };
-    const resetBy = String(body.resetBy || '').trim();
-    const roleHeader = String(req.headers['x-office-role'] || '').trim();
-    const isAuthorizedTrainer =
-      resetBy === 'trainer.demo' || roleHeader === 'Training Coordinator';
-    if (!isAuthorizedTrainer) {
-      res.status(403).json({
-        error: true,
-        msg: 'Seed reset is restricted to Training Coordinator (trainer.demo).',
-      });
+    const requestedOwner = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, requestedOwner)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope for reset (${requestedOwner}).` });
       return;
     }
     if (!body.state || typeof body.state !== 'object') {
       res.status(400).json({ error: true, msg: 'Initial seed state is required for reset.' });
       return;
     }
-    const saved = store.resetWorkspaceState(body.state, resetBy || 'trainer.demo');
+    const saved = store.resetWorkspaceState(body.state, claims.username);
     broadcastSyncEvent({
       eventId: `EVT-RESET-${saved.revision}-${Date.now()}`,
       type: 'state:reset',
-      ownerId: String(body.ownerId || 'OWN-ALPHA'),
+      ownerId: requestedOwner,
       originClientId: body.originClientId,
       timestamp: saved.updatedAt,
-      data: { revision: saved.revision, resetBy: resetBy || 'trainer.demo' },
+      data: { revision: saved.revision, resetBy: claims.username },
     });
     res.json({ ok: true, revision: saved.revision, updatedAt: saved.updatedAt });
   });
 
   // --------------------------------------------------------------------------
-  // Normalized Double-Entry Ledger API (SQLite)
+  // Normalized Double-Entry Ledger API (SQLite Training Sandbox)
   // --------------------------------------------------------------------------
-  app.get('/api/office/ledger/summary', (req, res) => {
-    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || 'OWN-ALPHA');
+  app.get('/api/office/ledger/summary', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     res.json(store.getLedgerSummary(ownerId));
   });
 
-  app.get('/api/office/ledger/accounts', (req, res) => {
-    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || 'OWN-ALPHA');
+  app.get('/api/office/ledger/accounts', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     res.json({ ok: true, ownerId, accounts: store.listLedgerAccountsSql(ownerId) });
   });
 
-  app.get('/api/office/ledger/journals', (req, res) => {
-    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || 'OWN-ALPHA');
+  app.get('/api/office/ledger/journals', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const accountCodePrefix = req.query.accountPrefix ? String(req.query.accountPrefix) : undefined;
     const periodCode = req.query.periodCode ? String(req.query.periodCode) : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 50;
@@ -287,13 +444,23 @@ async function startServer() {
     });
   });
 
-  app.get('/api/office/ledger/trial-balance', (req, res) => {
-    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || 'OWN-ALPHA');
+  app.get('/api/office/ledger/trial-balance', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const periodCode = req.query.periodCode ? String(req.query.periodCode) : undefined;
     res.json(store.getLedgerTrialBalanceSql(ownerId, periodCode));
   });
 
-  app.post('/api/office/ledger/post', (req, res) => {
+  app.post('/api/office/ledger/post', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({ error: true, msg: `Role "${claims.role}" cannot post ledger entries.` });
+      return;
+    }
     const body = (req.body || {}) as {
       ownerId?: string;
       entryDate?: string;
@@ -303,12 +470,16 @@ async function startServer() {
       sourceId?: string;
       idempotencyKey?: string;
       description?: string;
-      makerActorId?: string;
       checkerActorId?: string;
       lines?: Array<{ accountCode: string; accountName?: string; debitCents: number; creditCents: number }>;
     };
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const result = store.postLedgerJournalSql({
-      ownerId: String(body.ownerId || 'OWN-ALPHA'),
+      ownerId,
       entryDate: String(body.entryDate || new Date().toISOString().slice(0, 10)),
       periodCode: String(body.periodCode || '2019-03'),
       ruleId: String(body.ruleId || 'Manual'),
@@ -316,7 +487,7 @@ async function startServer() {
       sourceId: String(body.sourceId || ''),
       idempotencyKey: String(body.idempotencyKey || `API-${Date.now()}`),
       description: String(body.description || 'SQLite ledger entry'),
-      makerActorId: String(body.makerActorId || 'SYSTEM'),
+      makerActorId: claims.sub,
       checkerActorId: body.checkerActorId ? String(body.checkerActorId) : undefined,
       lines: Array.isArray(body.lines) ? body.lines : [],
     });
@@ -327,7 +498,12 @@ async function startServer() {
     res.json(result);
   });
 
-  app.post('/api/office/ledger/reverse', (req, res) => {
+  app.post('/api/office/ledger/reverse', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({ error: true, msg: `Role "${claims.role}" cannot reverse ledger entries.` });
+      return;
+    }
     const body = (req.body || {}) as {
       ownerId?: string;
       journalId?: string;
@@ -335,16 +511,20 @@ async function startServer() {
       periodCode?: string;
       reason?: string;
       makerActorId?: string;
-      checkerActorId?: string;
     };
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const result = store.reverseLedgerJournalSql({
-      ownerId: String(body.ownerId || 'OWN-ALPHA'),
+      ownerId,
       journalId: String(body.journalId || ''),
       entryDate: String(body.entryDate || new Date().toISOString().slice(0, 10)),
       periodCode: String(body.periodCode || '2019-03'),
       reason: String(body.reason || 'PR-25 Mirror Reversal'),
-      makerActorId: String(body.makerActorId || ''),
-      checkerActorId: String(body.checkerActorId || ''),
+      makerActorId: String(body.makerActorId || 'USR-SYNTH-03'),
+      checkerActorId: claims.sub,
     });
     if (!result.ok) {
       res.status(400).json({ error: true, msg: result.error });
@@ -353,20 +533,28 @@ async function startServer() {
     res.json(result);
   });
 
-  app.post('/api/office/ledger/period-close', (req, res) => {
+  app.post('/api/office/ledger/period-close', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({ error: true, msg: `Role "${claims.role}" cannot close accounting periods.` });
+      return;
+    }
     const body = (req.body || {}) as {
       ownerId?: string;
       periodCode?: string;
-      closedBy?: string;
       makerActorId?: string;
-      checkerActorId?: string;
     };
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const result = store.requestPeriodCloseSql({
-      ownerId: String(body.ownerId || 'OWN-ALPHA'),
+      ownerId,
       periodCode: String(body.periodCode || '2019-03'),
-      closedBy: String(body.closedBy || 'Demo General Manager'),
+      closedBy: claims.displayName,
       makerActorId: String(body.makerActorId || 'USR-SYNTH-03'),
-      checkerActorId: String(body.checkerActorId || 'USR-SYNTH-02'),
+      checkerActorId: claims.sub,
     });
     if (!result.ok) {
       res.status(400).json({ error: true, msg: result.error });
@@ -375,28 +563,43 @@ async function startServer() {
     res.json(result);
   });
 
-  app.get('/api/office/ledger/manifest', (req, res) => {
-    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || 'OWN-ALPHA');
+  app.get('/api/office/ledger/manifest', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    const ownerId = String(req.query.ownerId || req.headers['x-owner-id'] || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     res.json(store.getBackupLedgerManifest(ownerId));
   });
 
   // --------------------------------------------------------------------------
   // Local Evidence Vault Retrieval & Listing
   // --------------------------------------------------------------------------
-  app.get('/api/office/uploads', (req, res) => {
+  app.get('/api/office/uploads', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
     const ownerId =
       typeof req.query.ownerId === 'string'
         ? req.query.ownerId
         : typeof req.headers['x-owner-id'] === 'string'
           ? req.headers['x-owner-id']
-          : undefined;
+          : claims.defaultOwnerId;
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     res.json({ ok: true, files: store.listUploadedFiles(ownerId) });
   });
 
-  app.get('/api/office/uploads/:fileId', (req, res) => {
+  app.get('/api/office/uploads/:fileId', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
     const file = store.getUploadedFile(req.params.fileId);
     if (!file) {
       res.status(404).json({ error: true, msg: 'Evidence file not found.' });
+      return;
+    }
+    if (!isOwnerAllowed(claims, file.meta.ownerId)) {
+      res.status(403).json({ error: true, msg: 'Forbidden cross-owner upload access.' });
       return;
     }
     const requestedOwner =
@@ -417,9 +620,9 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // Zero-Key Local VAPID Web Push API
+  // Zero-Key Local VAPID Web Push API (Authenticated)
   // --------------------------------------------------------------------------
-  app.get('/api/office/push/vapid-key', (_req, res) => {
+  app.get('/api/office/push/vapid-key', requireOfficeAuth, (_req, res) => {
     res.json({
       ok: true,
       publicKey: store.getVapidPublicKey(),
@@ -427,7 +630,8 @@ async function startServer() {
     });
   });
 
-  app.post('/api/office/push/subscribe', (req, res) => {
+  app.post('/api/office/push/subscribe', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
     const body = (req.body || {}) as {
       endpoint?: string;
       p256dh?: string;
@@ -435,8 +639,12 @@ async function startServer() {
       device_label?: string;
       deviceLabel?: string;
       ownerId?: string;
-      actorId?: string;
     };
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     if (!body.endpoint || !body.p256dh || !body.auth) {
       res.status(400).json({ error: true, msg: 'endpoint, p256dh, and auth are required.' });
       return;
@@ -446,13 +654,13 @@ async function startServer() {
       p256dh: body.p256dh,
       auth: body.auth,
       deviceLabel: body.deviceLabel || body.device_label || 'AD-PRMS Device',
-      ownerId: body.ownerId,
-      actorId: body.actorId,
+      ownerId,
+      actorId: claims.sub,
     });
     res.status(200).json({ ok: true, id: saved.endpoint, totalSubscribers: store.getPushSubscribersCount() });
   });
 
-  app.delete('/api/office/push/subscribe', (req, res) => {
+  app.delete('/api/office/push/subscribe', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
     const body = (req.body || {}) as { endpoint?: string };
     if (body.endpoint) {
       store.removePushSubscription(body.endpoint);
@@ -460,7 +668,12 @@ async function startServer() {
     res.json({ ok: true, totalSubscribers: store.getPushSubscribersCount() });
   });
 
-  app.post('/api/office/push/send', async (req, res) => {
+  app.post('/api/office/push/send', requireOfficeAuth, async (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({ error: true, msg: 'Push broadcast is restricted to staff roles.' });
+      return;
+    }
     const body = (req.body || {}) as {
       title?: string;
       body?: string;
@@ -468,18 +681,23 @@ async function startServer() {
       tag?: string;
       ownerId?: string;
     };
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const result = await store.sendPushNotifications({
       title: body.title || 'AD-PRMS Office Test Alert',
       body: body.body || 'Background Web Push is active via local SQLite VAPID.',
       url: body.url || '/',
       tag: body.tag || 'adprms-office-push',
-      ownerId: body.ownerId,
+      ownerId,
     });
     res.json({ ok: true, mode: 'local-sqlite-vapid', ...result });
   });
 
   // --------------------------------------------------------------------------
-  // Simulated Tenant Phone OTP (Office Test & Training Mode)
+  // Simulated Tenant Phone OTP (Issues Signed Tenant Cookie Upon Verification)
   // --------------------------------------------------------------------------
   app.post('/api/office/auth/tenant/otp/request', (req, res) => {
     const body = (req.body || {}) as { msisdn?: string; locale?: 'en' | 'am' };
@@ -517,6 +735,11 @@ async function startServer() {
       res.status(400).json({ error: true, detail: result.error || 'OTP verification failed.' });
       return;
     }
+    const dirEntry = findDirectoryEntryByUsername(result.account.username);
+    if (dirEntry) {
+      const claims = buildClaimsFromDirectory(dirEntry);
+      appendSessionCookie(res, req, signOfficeSessionToken(claims));
+    }
     res.json({
       ok: true,
       msisdn: result.msisdn,
@@ -525,13 +748,24 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // ArifPay, Telebirr & SMS Sandbox Routes (Persisted in SQLite)
+  // ArifPay, Telebirr & SMS Sandbox Routes (Session-Gated & Fail-Closed Webhooks)
   // --------------------------------------------------------------------------
-  app.post('/api/gateways/arifpay/session', (req, res) => {
+  app.post('/api/gateways/arifpay/session', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
     const body = (req.body || {}) as Record<string, unknown>;
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
+
     const nonce = String(body.nonce || `AP-NONCE-${Date.now()}`);
     const existing = store.getArifPaySessionByNonce(nonce);
     if (existing) {
+      if (existing.ownerId !== ownerId) {
+        res.status(403).json({ error: true, msg: 'Forbidden cross-owner ArifPay nonce.' });
+        return;
+      }
       res.status(200).json({ error: false, reused: true, data: existing });
       return;
     }
@@ -549,8 +783,8 @@ async function startServer() {
     const session: ArifPayServerSession = {
       sessionId,
       nonce,
-      ownerId: String(body.ownerId || 'OWN-ALPHA'),
-      tenantId: String(body.tenantId || ''),
+      ownerId,
+      tenantId: String(body.tenantId || claims.tenantId || ''),
       chargeId: String(body.chargeId || ''),
       amountEtb,
       paymentMethods: Array.isArray(body.paymentMethods)
@@ -566,7 +800,8 @@ async function startServer() {
     res.status(200).json({ error: false, reused: false, data: session });
   });
 
-  app.post('/api/gateways/arifpay/verify', (req, res) => {
+  app.post('/api/gateways/arifpay/verify', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
     const body = (req.body || {}) as Record<string, unknown>;
     const sessionId = String(body.sessionId || '').trim();
     if (!sessionId) {
@@ -578,73 +813,135 @@ async function startServer() {
       res.status(404).json({ error: true, msg: 'ArifPay session not found.' });
       return;
     }
-    session.status = 'COMPLETED';
-    store.upsertArifPaySession(session);
-    res.status(200).json({ error: false, data: session });
-  });
-
-  app.post('/api/webhooks/arifpay', async (req, res) => {
-    const body = (req.body || {}) as Record<string, unknown>;
-    const sig = String(req.headers['x-arifpay-signature'] || '');
-    if (!verifyOptionalArifPaySignature(JSON.stringify(body), sig)) {
-      res.status(403).json({ error: true, msg: 'Invalid ArifPay webhook signature.' });
+    if (!isOwnerAllowed(claims, session.ownerId)) {
+      res.status(403).json({ error: true, msg: 'Forbidden cross-owner gateway verification.' });
       return;
     }
-    const sessionId = String(body.sessionId || '');
-    const session = store.getArifPaySessionById(sessionId);
-    if (session) {
-      session.status = 'COMPLETED';
-      store.upsertArifPaySession(session);
+    session.status = 'COMPLETED';
+    store.upsertArifPaySession(session);
+    res.status(200).json({ error: false, sandboxOnly: true, data: session });
+  });
+
+  app.post('/api/webhooks/arifpay', async (req: AuthedRequest, res: Response) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const rawBody = req.rawBody ?? JSON.stringify(body);
+    const sig = String(req.headers['x-arifpay-signature'] || '');
+    const ts = req.headers['x-arifpay-timestamp'] ? String(req.headers['x-arifpay-timestamp']) : undefined;
+
+    const sigCheck = verifyArifPayWebhookSignature({
+      rawBody,
+      signatureHeader: sig,
+      timestampHeader: ts,
+    });
+    if (!sigCheck.ok) {
+      res.status(sigCheck.status).json({ error: true, msg: sigCheck.reason });
+      return;
     }
-    const ownerId = String(body.ownerId || session?.ownerId || 'OWN-ALPHA');
-    const amountEtb = Number(body.amountEtb || session?.amountEtb || 0);
+
+    const sessionId = String(body.sessionId || '').trim();
+    const replayKey = `AP:${sessionId}:${String(body.transactionId || '')}:${sig.slice(0, 16)}`;
+    if (seenWebhookReplayKeys.has(replayKey)) {
+      res.status(409).json({ error: true, msg: 'Duplicate replayed ArifPay webhook ignored.' });
+      return;
+    }
+
+    const session = store.getArifPaySessionById(sessionId);
+    if (!session) {
+      res.status(404).json({ error: true, msg: 'ArifPay session not found.' });
+      return;
+    }
+
+    const reportedOwner = String(body.ownerId || session.ownerId);
+    const reportedAmount = Number(body.amountEtb ?? session.amountEtb);
+    if (reportedOwner !== session.ownerId || Math.abs(reportedAmount - session.amountEtb) > 0.01) {
+      res.status(400).json({
+        error: true,
+        msg: 'ArifPay webhook owner or amount mismatch rejected.',
+      });
+      return;
+    }
+
+    seenWebhookReplayKeys.add(replayKey);
+    session.status = 'COMPLETED';
+    store.upsertArifPaySession(session);
+
+    // Sandbox simulator emits non-authoritative sandbox telemetry, never live settlement clearance
     broadcastSyncEvent({
-      eventId: `EVT-AP-${Date.now()}`,
-      type: 'payment:settled',
-      ownerId,
+      eventId: `EVT-AP-SBX-${Date.now()}`,
+      type: 'sandbox:webhook:received' as SyncEventPayload['type'],
+      ownerId: session.ownerId,
       timestamp: new Date().toISOString(),
       data: {
-        gateway: 'ArifPay Checkout',
+        gateway: 'ArifPay Checkout (Sandbox)',
+        sandboxOnly: true,
         sessionId,
-        transactionId: String(body.transactionId || session?.transactionId || ''),
-        amountEtb,
+        transactionId: String(body.transactionId || session.transactionId || ''),
+        amountEtb: session.amountEtb,
         status: String(body.status || 'COMPLETED'),
-        signatureVerified: Boolean(process.env.ARIFPAY_WEBHOOK_SECRET),
+        signatureVerified: true,
       },
     });
     void store.sendPushNotifications({
-      title: 'ArifPay Sandbox Settlement',
-      body: `ETB ${amountEtb.toLocaleString()} settled in Office Test Mode.`,
-      ownerId,
+      title: 'ArifPay Sandbox Webhook Verified',
+      body: `ETB ${session.amountEtb.toLocaleString()} sandbox event verified in Training Mode.`,
+      ownerId: session.ownerId,
       tag: `arifpay-${sessionId}`,
     });
-    res.status(200).json({ received: true, provider: 'ArifPay Sandbox (SQLite)' });
+    res.status(200).json({
+      received: true,
+      sandboxOnly: true,
+      provider: 'ArifPay Sandbox (SQLite)',
+    });
   });
 
-  app.post('/api/webhooks/telebirr', (req, res) => {
+  app.post('/api/webhooks/telebirr', (req: AuthedRequest, res: Response) => {
     const body = (req.body || {}) as Record<string, unknown>;
-    if (!verifyOptionalTelebirrSignature(body)) {
-      res.status(403).json({ error: true, msg: 'Invalid Telebirr RSA signature.' });
+    const sigCheck = verifyTelebirrWebhookSignature({ payload: body });
+    if (!sigCheck.ok) {
+      res.status(sigCheck.status).json({ error: true, msg: sigCheck.reason });
       return;
     }
+
+    const merchOrderId = String(body.merch_order_id || body.nonce || '').trim();
+    const replayKey = `TB:${merchOrderId}:${String(body.payment_order_id || '')}`;
+    if (merchOrderId && seenWebhookReplayKeys.has(replayKey)) {
+      res.status(409).json({ error: true, msg: 'Duplicate replayed Telebirr webhook ignored.' });
+      return;
+    }
+    if (merchOrderId) seenWebhookReplayKeys.add(replayKey);
+
     const ownerId = String(body.ownerId || 'OWN-ALPHA');
     broadcastSyncEvent({
-      eventId: `EVT-TB-${Date.now()}`,
-      type: 'payment:settled',
+      eventId: `EVT-TB-SBX-${Date.now()}`,
+      type: 'sandbox:webhook:received' as SyncEventPayload['type'],
       ownerId,
       timestamp: new Date().toISOString(),
       data: {
-        gateway: 'Telebirr USSD QR',
-        ...body,
-        signatureVerified: Boolean(process.env.TELEBIRR_PUBLIC_KEY_PEM),
+        gateway: 'Telebirr USSD QR (Sandbox)',
+        sandboxOnly: true,
+        merchOrderId,
+        signatureVerified: true,
       },
     });
-    res.status(200).json({ received: true, provider: 'Telebirr Sandbox (SQLite)' });
+    res.status(200).json({
+      received: true,
+      sandboxOnly: true,
+      provider: 'Telebirr Sandbox (SQLite)',
+    });
   });
 
-  app.post('/api/sms/dispatch', (req, res) => {
+  app.post('/api/sms/dispatch', requireOfficeAuth, (req: AuthedRequest, res: Response) => {
+    const claims = req.officeSession!;
+    if (!canMutateStaffLedgerOrState(claims)) {
+      res.status(403).json({ error: true, msg: `Role "${claims.role}" cannot dispatch SMS notices.` });
+      return;
+    }
     const body = (req.body || {}) as Record<string, unknown>;
-    const ownerId = String(body.ownerId || 'OWN-ALPHA');
+    const ownerId = String(body.ownerId || claims.defaultOwnerId);
+    if (!isOwnerAllowed(claims, ownerId)) {
+      res.status(403).json({ error: true, msg: `Forbidden owner scope: ${ownerId}` });
+      return;
+    }
     const logged = store.logSmsOutbox({
       ownerId,
       msisdn: String(body.msisdn || '+251900000000'),
@@ -670,7 +967,8 @@ async function startServer() {
     });
   });
 
-  if (!isProduction) {
+  const shouldAttachVite = options?.attachVite ?? !isProduction;
+  if (shouldAttachVite) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -699,14 +997,26 @@ async function startServer() {
     });
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `AD-PRMS Office Test & Training Server (SQLite) listening on http://0.0.0.0:${PORT}`
-    );
-  });
+  return { app, server, store, wss };
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start AD-PRMS server:', err);
-  process.exit(1);
-});
+const isMainEntry =
+  typeof process !== 'undefined' &&
+  Array.isArray(process.argv) &&
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(import.meta.filename);
+
+if (isMainEntry) {
+  createTrainingServerApp()
+    .then(({ server }) => {
+      server.listen(PORT, BIND_HOST, () => {
+        console.log(
+          `AD-PRMS Office Test & Training Server (SQLite) listening on http://${BIND_HOST}:${PORT}`
+        );
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start AD-PRMS server:', err);
+      process.exit(1);
+    });
+}

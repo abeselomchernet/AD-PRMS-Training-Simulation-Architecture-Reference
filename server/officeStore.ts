@@ -48,6 +48,7 @@ export interface SyncEventPayload {
   eventId: string;
   type:
     | 'payment:settled'
+    | 'sandbox:webhook:received'
     | 'maintenance:message'
     | 'maintenance:ticket'
     | 'approval:decided'

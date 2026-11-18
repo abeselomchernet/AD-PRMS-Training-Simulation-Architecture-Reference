@@ -9,6 +9,7 @@ from apps.portfolio.models import Lease, OwnerEntity, TenantProfile, Unit
 from .models import (
     AccountingPeriod,
     CloseChecklistItem,
+    DepositMovement,
     JournalEntry,
     JournalLine,
     Ledger,
@@ -17,7 +18,6 @@ from .models import (
 )
 
 TWO_DP = Decimal('0.01')
-CASH_DAILY_CAP_ETB = Decimal('50000.00')
 
 
 def _q2(val: Any) -> Decimal:
@@ -38,6 +38,8 @@ def post_ledger_event(
     lines: Iterable[dict[str, Any]],
     maker_actor_id: str,
     checker_actor_id: str = '',
+    approval_request_id=None,
+    approval_payload_hash: str = '',
     allow_closed_period: bool = False,
     e_invoice_metadata: dict[str, Any] | None = None,
 ) -> JournalEntry | None:
@@ -47,7 +49,7 @@ def post_ledger_event(
     - Idempotency key: returns existing journal if already posted.
     - Closed period lock: raises ValidationError unless reopening/year-end override is authorized.
     - Balanced entry invariant: sum(debits) == sum(credits) > 0.
-    - Tax-locked account protection & ETB 50,000 daily cash cap enforcement.
+    - Tax-locked account protection & configurable daily cumulative cash cap on account 1010.
     """
     if rule_id == 'PR-08':
         return None
@@ -100,10 +102,22 @@ def post_ledger_event(
     if total_dr != total_cr or total_dr <= 0:
         raise ValidationError(f'Unbalanced journal: debit {total_dr} != credit {total_cr}.')
 
-    if cash_inflow_or_outflow > CASH_DAILY_CAP_ETB and source_type != 'OpeningBalance':
-        raise ValidationError(
-            f'Proclamation 1395/2025 cash cap exceeded: ETB {cash_inflow_or_outflow} > ETB {CASH_DAILY_CAP_ETB}.'
+    ledger_cfg = Ledger.objects.filter(owner=owner).first()
+    if ledger_cfg and ledger_cfg.enforce_daily_cash_cap and cash_inflow_or_outflow > Decimal('0.00') and source_type != 'OpeningBalance':
+        prior_cash = JournalLine.objects.filter(
+            owner=owner,
+            account__code='1010',
+            entry__entry_date=entry_date,
+        ).exclude(entry__source_type='OpeningBalance').aggregate(
+            dr=Sum('debit_etb'),
+            cr=Sum('credit_etb'),
         )
+        prior_total = _q2((prior_cash['dr'] or Decimal('0.00')) + (prior_cash['cr'] or Decimal('0.00')))
+        cumulative_cash = _q2(prior_total + cash_inflow_or_outflow)
+        if cumulative_cash > ledger_cfg.daily_cash_cap_etb:
+            raise ValidationError(
+                f'Daily cash cap exceeded for {entry_date}: cumulative ETB {cumulative_cash} > ETB {ledger_cfg.daily_cash_cap_etb}.'
+            )
 
     seq = JournalEntry.objects.filter(owner=owner).count() + 1
     journal_number = f'JRN-{owner.code.replace("OWN-", "")}-{period.period_code.replace("-", "")}-{seq:04d}'
@@ -127,6 +141,8 @@ def post_ledger_event(
         description=description,
         maker_actor_id=maker_actor_id,
         checker_actor_id=checker_actor_id,
+        approval_request_id=approval_request_id,
+        approval_payload_hash=approval_payload_hash,
         e_invoice_metadata=invoice_meta,
     )
 
@@ -148,6 +164,37 @@ def post_ledger_event(
 
 
 @transaction.atomic
+def record_deposit_movement(
+    *,
+    owner: OwnerEntity,
+    tenant: TenantProfile,
+    lease: Lease,
+    movement_type: str,
+    signed_amount_etb: Decimal,
+    effective_date,
+    reference: str,
+    maker_actor_id: str,
+    posted_journal: JournalEntry | None = None,
+    notes: str = '',
+) -> DepositMovement:
+    """Records an immutable event in the independent DepositMovement subledger."""
+    if tenant.owner_id != owner.id or lease.owner_id != owner.id:
+        raise ValidationError('Cross-owner invariant violation on DepositMovement.')
+    return DepositMovement.objects.create(
+        owner=owner,
+        tenant=tenant,
+        lease=lease,
+        movement_type=movement_type,
+        signed_amount_etb=_q2(signed_amount_etb),
+        effective_date=effective_date,
+        reference=reference,
+        posted_journal=posted_journal,
+        maker_actor_id=maker_actor_id,
+        notes=notes,
+    )
+
+
+@transaction.atomic
 def reverse_journal_entry(
     *,
     original_entry: JournalEntry,
@@ -156,6 +203,8 @@ def reverse_journal_entry(
     reason: str,
     maker_actor_id: str,
     checker_actor_id: str,
+    approval_request_id=None,
+    approval_payload_hash: str = '',
 ) -> JournalEntry:
     """PR-25 mirror reversal with Maker-Checker Segregation of Duties."""
     if not checker_actor_id or checker_actor_id == maker_actor_id:
@@ -188,6 +237,8 @@ def reverse_journal_entry(
         lines=mirror_lines,
         maker_actor_id=maker_actor_id,
         checker_actor_id=checker_actor_id,
+        approval_request_id=approval_request_id,
+        approval_payload_hash=approval_payload_hash,
     )
     assert reversal is not None
     reversal.reversal_of_journal = original_entry
@@ -201,31 +252,49 @@ def reverse_journal_entry(
 
 def evaluate_three_way_deposit_check(*, owner: OwnerEntity) -> dict[str, Any]:
     """
-    Proposal §6.3 / §12.9:
-    Lease Register Deposits == Account 2120 Tenant Deposits Held == Tenant Sub-Ledger Deposit Liability
+    Independent 3-way security deposit reconciliation (#11):
+      1) Net Active Lease Register Deposits (Lease security_deposit_etb less active-lease deductions/refunds)
+      2) GL Account 2120 Tenant Deposits Held (credit - debit across JournalLine)
+      3) Independent DepositMovement Subledger (sum of signed_amount_etb across DepositMovement)
+    Note: Does NOT compute subledger by grouping GL 2120 JournalLines, so GL-to-subledger discrepancies are caught.
     """
-    lease_sum = (
+    gross_lease_sum = (
         Lease.objects.filter(owner=owner, status='Active').aggregate(total=Sum('security_deposit_etb'))['total']
         or Decimal('0.00')
     )
+    active_deductions_or_refunds = (
+        DepositMovement.objects.filter(
+            owner=owner,
+            lease__status='Active',
+            movement_type__in=[DepositMovement.MovementType.DEDUCTION, DepositMovement.MovementType.REFUND],
+            signed_amount_etb__lt=Decimal('0.00'),
+        ).aggregate(total=Sum('signed_amount_etb'))['total']
+        or Decimal('0.00')
+    )
+    lease_register_etb = _q2(gross_lease_sum + active_deductions_or_refunds)
+
     gl_agg = JournalLine.objects.filter(owner=owner, account__code='2120').aggregate(
         dr=Sum('debit_etb'),
         cr=Sum('credit_etb'),
     )
-    gl_2120 = (gl_agg['cr'] or Decimal('0.00')) - (gl_agg['dr'] or Decimal('0.00'))
+    gl_2120 = _q2((gl_agg['cr'] or Decimal('0.00')) - (gl_agg['dr'] or Decimal('0.00')))
 
-    tenant_rows = (
-        JournalLine.objects.filter(owner=owner, account__code='2120')
-        .values('tenant')
-        .annotate(dr=Sum('debit_etb'), cr=Sum('credit_etb'))
+    subledger_sum = _q2(
+        DepositMovement.objects.filter(owner=owner).aggregate(total=Sum('signed_amount_etb'))['total']
+        or Decimal('0.00')
     )
-    subledger_sum = sum(((row['cr'] or Decimal('0.00')) - (row['dr'] or Decimal('0.00')) for row in tenant_rows), Decimal('0.00'))
+    unlinked_movements = DepositMovement.objects.filter(owner=owner, posted_journal__isnull=True).count()
 
-    passed = _q2(lease_sum) == _q2(gl_2120) == _q2(subledger_sum)
+    passed = (lease_register_etb == gl_2120 == subledger_sum) and (unlinked_movements == 0)
     return {
-        'lease_register_etb': _q2(lease_sum),
-        'gl_2120_etb': _q2(gl_2120),
-        'subledger_etb': _q2(subledger_sum),
+        'gross_active_lease_deposits_etb': _q2(gross_lease_sum),
+        'active_lease_adjustments_etb': _q2(active_deductions_or_refunds),
+        'lease_register_etb': lease_register_etb,
+        'gl_2120_etb': gl_2120,
+        'subledger_etb': subledger_sum,
+        'gl_vs_subledger_variance_etb': _q2(gl_2120 - subledger_sum),
+        'lease_vs_subledger_variance_etb': _q2(lease_register_etb - subledger_sum),
+        'unlinked_movements': unlinked_movements,
         'passed': passed,
     }
 
@@ -238,7 +307,7 @@ def request_period_close(
     maker_actor_id: str,
     checker_actor_id: str,
 ) -> AccountingPeriod:
-    """Locks period after 9-check validation and enforces Maker-Checker SoD."""
+    """Locks period after close validations and enforces Maker-Checker SoD."""
     if not checker_actor_id or checker_actor_id == maker_actor_id:
         raise ValidationError('Maker-Checker SoD violation: period close requires an independent checker.')
 
@@ -279,7 +348,11 @@ def request_period_close(
         owner=owner,
         period=period,
         check_code='CHK-3WAY-DEPOSIT',
-        defaults={'label': '3-way deposit tie-out == 2120', 'passed': three_way['passed']},
+        defaults={
+            'label': '3-way deposit tie-out (Lease == DepositMovement Subledger == GL 2120)',
+            'passed': three_way['passed'],
+            'detail': f"lease={three_way['lease_register_etb']} subledger={three_way['subledger_etb']} gl2120={three_way['gl_2120_etb']}",
+        },
     )
     CloseChecklistItem.objects.update_or_create(
         owner=owner,
@@ -289,7 +362,7 @@ def request_period_close(
     )
 
     if not three_way['passed'] or not recon_ok:
-        raise ValidationError('Close checklist failed: verify bank 1020 reconciliation and 3-way deposit match.')
+        raise ValidationError('Close checklist failed: verify bank 1020 reconciliation and independent 3-way deposit match.')
 
     period.status = AccountingPeriod.Status.CLOSED
     period.last_trial_balance_etb = total_dr
