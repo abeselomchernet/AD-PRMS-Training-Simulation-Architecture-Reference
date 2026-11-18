@@ -11,4 +11,5 @@ test-results/
 !.env.example
 .aistudio/
 .data/
-
+__pycache__/
+*.pyc
