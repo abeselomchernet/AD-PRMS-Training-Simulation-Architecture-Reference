@@ -134,6 +134,7 @@ def test_historical_tax_rule_pack_effective_dates_and_reproducibility():
     assert after_change['books']['estimated_tax_etb'] == Decimal('120000.00')
 
 
+@pytest.mark.django_db
 def test_pr08_failed_gateway_and_sod_reversal_guards():
     dummy_owner = OwnerEntity(id=uuid.uuid4(), code='OWN-UNIT', name='Unit Owner', entity_type='Individual', effective_date=date(2026, 1, 1))
     res = post_ledger_event(

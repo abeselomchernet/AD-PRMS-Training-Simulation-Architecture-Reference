@@ -1,6 +1,7 @@
 from datetime import date
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from apps.common.permissions import bind_postgres_rls_owner
 from .models import Building, OwnerEntity, PartyIdentity, Property
 
 
@@ -21,6 +22,7 @@ def seed_single_title_holder_portfolio(*, owner_code: str = 'OWN-ABDULWEHAB') ->
             'effective_date': date(2026, 1, 1),
         },
     )
+    bind_postgres_rls_owner(owner.code)
 
     title_holder, _ = PartyIdentity.objects.get_or_create(
         owner=owner,

@@ -171,9 +171,9 @@ def test_api_rbac_approval_forgery_protection_and_prod_ui(tmp_path):
         assert JournalEntry.objects.filter(id=ok_post.data['id'], approval_request_id=apr_id).exists()
 
         # 6. Gateway webhooks fail closed when disabled (503) or unsigned (403)
-        assert client.post('/api/v1/gateways/webhooks/arifpay/', {}, format='json').status_code == 503
+        assert client.post('/api/v1/gateways/arifpay/webhook/', {}, format='json').status_code == 503
         with override_settings(ENABLE_LIVE_GATEWAYS=True, ARIFPAY_WEBHOOK_SECRET='whsec_test'):
-            assert client.post('/api/v1/gateways/webhooks/arifpay/', {'nonce': 'X'}, format='json').status_code == 403
+            assert client.post('/api/v1/gateways/arifpay/webhook/', {'nonce': 'X'}, format='json').status_code == 403
 
         # 7. Backup manifest secret leakage rejection & full DB/Audit chain reconciliation
         bad_manifest = {'backup_id': 'B1', 'backup_encryption_passphrase': 'LEAK'}

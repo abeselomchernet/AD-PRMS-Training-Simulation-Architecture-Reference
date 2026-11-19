@@ -110,17 +110,17 @@ def test_single_title_holder_five_buildings_and_inter_entity_block():
             effective_date=date(2026, 1, 1),
         )
         bind_postgres_rls_owner('OWN-DEKEBO')
-        result = seed_single_title_holder_portfolio(owner=owner)
-        assert result['title_holder'] == 'Abdulwehab Dekebo'
+        result = seed_single_title_holder_portfolio(owner_code=owner.code)
+        assert result['title_holder'].legal_name == 'Abdulwehab Dekebo'
         assert len(result['buildings']) == 5
-        assert result['pending_trading_identity'] == 'Abdulwehab Dekebo Trading'
+        assert result['trading_party'].legal_name == 'Abdulwehab Dekebo Trading'
 
-        trading = PartyIdentity.objects.get(owner=owner, code='PARTY-TRADING-PENDING')
+        trading = PartyIdentity.objects.get(owner=owner, code='PARTY-AD-TRADING')
         assert trading.inter_entity_posting_enabled is False
         assert trading.confirmation_status == PartyIdentity.ConfirmationStatus.PENDING_DOCUMENTARY
 
         with pytest.raises(ValidationError):
-            assert_inter_entity_posting_permitted(owner=owner, target_party_code='PARTY-TRADING-PENDING')
+            assert_inter_entity_posting_permitted(owner=owner, target_party_code='PARTY-AD-TRADING')
 
 
 @pytest.mark.django_db
