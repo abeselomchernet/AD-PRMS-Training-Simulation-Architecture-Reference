@@ -212,6 +212,9 @@ export function resolveBindHost(
   if (String(env.OFFICE_ENABLE_LAN || '').toLowerCase() === 'true') {
     return '0.0.0.0';
   }
+  if (env.K_SERVICE || env.CLOUD_RUN_JOB || env.CODESANDBOX_HOST) {
+    return '0.0.0.0';
+  }
   return '127.0.0.1';
 }
 

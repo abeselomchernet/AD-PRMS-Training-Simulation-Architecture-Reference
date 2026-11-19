@@ -406,4 +406,50 @@ describe('AD-PRMS Application Integration Flows', () => {
       await screen.findByText(/Monthly straight-line depreciation charge — buildings & equipment \(5900\)/i)
     ).toBeInTheDocument();
   }, 15_000);
+
+  it('allows tenants on the Pay tab to request a manual payment reminder email or notification for missed deadlines', async () => {
+    render(<App />);
+
+    const tenantBtns = screen.getAllByRole('button', { name: /Open Tenant Mobile/i });
+    fireEvent.click(tenantBtns[0]);
+
+    expect(await screen.findByTestId('tenant-mobile-app')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^Pay$/i }));
+
+    // Missed-deadline banner card & per-invoice CTA render for overdue/past-due invoices
+    const missedCard = await screen.findByTestId('missed-deadline-reminder-card');
+    expect(missedCard.textContent).toContain('Missed Payment Deadline');
+    expect(await screen.findByTestId('request-reminder-btn-INV-SYNTH-A-1101')).toBeInTheDocument();
+
+    // Open Request Payment Reminder sheet from specific overdue invoice
+    fireEvent.click(screen.getByTestId('request-reminder-btn-INV-SYNTH-A-1101'));
+
+    const emailInput = (await screen.findByLabelText(/Recipient Email \*/i)) as HTMLInputElement;
+    expect(emailInput.value).toBe('tenant001.demo@synthetic.example.et');
+
+    // Validation blocks malformed email
+    fireEvent.change(emailInput, { target: { value: 'not-an-email' } });
+    fireEvent.click(screen.getByTestId('submit-payment-reminder-btn'));
+    expect(
+      await screen.findByText(/Enter a valid email address to receive the payment reminder/i)
+    ).toBeInTheDocument();
+
+    // Enter valid email + note and submit using Email & Notification
+    fireEvent.change(emailInput, { target: { value: 'tenant001.custom@synthetic.example.et' } });
+    fireEvent.change(screen.getByLabelText(/Optional Note/i), {
+      target: { value: 'Settling on Friday morning' },
+    });
+    fireEvent.click(screen.getByTestId('submit-payment-reminder-btn'));
+
+    const confirmation = await screen.findByTestId('reminder-sent-confirmation');
+    expect(confirmation.textContent).toContain('INV-SYNTH-A-1101');
+    expect(confirmation.textContent).toContain('tenant001.custom@synthetic.example.et');
+    expect(confirmation.textContent).toContain('Settling on Friday morning');
+
+    // View in Notices verifies both the generated Tenant Notice and SMS/Notification Alert Log
+    fireEvent.click(within(confirmation).getByRole('button', { name: /View in Notices/i }));
+    expect(
+      await screen.findByText(/Payment Reminder Sent \(Email & Notification\) — INV-SYNTH-A-1101/i)
+    ).toBeInTheDocument();
+  }, 15_000);
 });

@@ -1079,6 +1079,26 @@ export interface TenantNotificationPrefs {
   msisdn: string;
 }
 
+export type PaymentReminderChannel = 'Email' | 'Notification' | 'Email & Notification';
+
+export interface PaymentReminderRequestRecord {
+  id: string;
+  ownerId: OwnerId;
+  tenantId: string;
+  chargeIds: string[];
+  invoiceNumbers: string[];
+  totalOpenEtb: number;
+  channel: PaymentReminderChannel;
+  recipientEmail: string;
+  recipientMsisdn?: string;
+  note?: string;
+  emailSubject: string;
+  emailPreviewBody: string;
+  notificationBody: string;
+  requestedAt: string;
+  deliveryStatus: 'Delivered (Sandbox)' | 'Queued Offline';
+}
+
 export interface OfflinePendingAction {
   id: string;
   ownerId: OwnerId;

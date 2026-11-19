@@ -69,9 +69,24 @@ export default defineConfig(() => {
       alias: {
         '@': path.resolve(import.meta.dirname, '.'),
       },
+      dedupe: ['react', 'react-dom'],
+    },
+    optimizeDeps: {
+      include: [
+        'react',
+        'react-dom',
+        'react-dom/client',
+        'lucide-react',
+        'motion/react',
+        'recharts',
+        'firebase/app',
+        'firebase/auth',
+        'firebase/firestore',
+      ],
     },
     build: {
       rolldownOptions: {
+        input: path.resolve(import.meta.dirname, 'index.html'),
         output: {
           codeSplitting: {
             groups: [

@@ -162,7 +162,7 @@ def test_pr08_failed_gateway_and_sod_reversal_guards():
         )
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_ledger_posting_idempotency_period_lock_cash_cap_and_independent_3way_deposit():
     with transaction.atomic():
         owner = OwnerEntity.objects.create(

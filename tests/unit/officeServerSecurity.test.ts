@@ -47,9 +47,10 @@ describe('Express Training Server Security, Loopback Default & Fail-Closed Webho
     }
   });
 
-  it('defaults bind host to 127.0.0.1 unless explicitly overridden with OFFICE_ENABLE_LAN or --host', () => {
+  it('defaults bind host to 127.0.0.1 unless explicitly overridden with OFFICE_ENABLE_LAN, container env, or --host', () => {
     expect(resolveBindHost([], {})).toBe('127.0.0.1');
     expect(resolveBindHost([], { OFFICE_ENABLE_LAN: 'true' })).toBe('0.0.0.0');
+    expect(resolveBindHost([], { K_SERVICE: 'ais-dev-preview' })).toBe('0.0.0.0');
     expect(resolveBindHost(['--host', '0.0.0.0'], {})).toBe('0.0.0.0');
     expect(resolveBindHost([], { HOST: '192.168.1.50' })).toBe('192.168.1.50');
   });

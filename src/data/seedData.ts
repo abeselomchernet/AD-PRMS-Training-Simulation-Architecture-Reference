@@ -23,6 +23,7 @@ import {
   OwnerEntity,
   OwnerId,
   PaymentReceipt,
+  PaymentReminderRequestRecord,
   ProductionGateItem,
   PropertyRecord,
   PrototypeJournalEntry,
@@ -264,6 +265,7 @@ export interface SeedState {
   tenantNotices: TenantNoticeRecord[];
   smsLogs: SmsDispatchRecord[];
   tenantPrefs: TenantNotificationPrefs[];
+  paymentReminderRequests?: PaymentReminderRequestRecord[];
   ledgerConfigs: OwnerLedgerConfig[];
   ledgerAccountsV2: LedgerAccountV2[];
   accountingPeriods: AccountingPeriod[];
@@ -2415,6 +2417,7 @@ export function createInitialSeedState(): SeedState {
         msisdn: '+251910000003',
       },
     ],
+    paymentReminderRequests: [],
     ...(() => {
       const alphaBundle = buildHidarAlphaBundle();
       const betaBundle = buildBetaBaselineBundle();

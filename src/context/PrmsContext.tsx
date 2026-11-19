@@ -64,6 +64,8 @@ import {
   OwnerId,
   PaymentMethod,
   PaymentReceipt,
+  PaymentReminderChannel,
+  PaymentReminderRequestRecord,
   PersonaRole,
   ProductionGateItem,
   PropertyRecord,
@@ -132,6 +134,11 @@ import {
 } from '../services/accountingEngine';
 import { buildLedgerAccountsV2 } from '../data/accountingRulePack';
 import { buildHidarAlphaBundle } from '../data/hidarWorkedMonth';
+import {
+  buildManualReminderCopy,
+  isValidEmailAddress,
+  maskMsisdnForDisplay,
+} from '../utils/paymentReminders';
 
 export interface ToastMessage {
   id: string;
@@ -194,6 +201,7 @@ interface PrmsContextValue {
   ownerTenantNotices: TenantNoticeRecord[];
   ownerSmsLogs: SmsDispatchRecord[];
   ownerTenantPrefs: TenantNotificationPrefs[];
+  ownerPaymentReminderRequests: PaymentReminderRequestRecord[];
   ownerOromifaTemplates: OromifaContractTemplate[];
   saveOromifaTemplate: (input: {
     id?: string;
@@ -529,6 +537,14 @@ interface PrmsContextValue {
     arifpayMethod?: 'TELEBIRR' | 'CBE';
     autoVerified?: boolean;
   }) => PaymentReceipt | null;
+  requestTenantPaymentReminder: (input: {
+    tenantId: string;
+    chargeIds: string[];
+    channel: PaymentReminderChannel;
+    recipientEmail?: string;
+    recipientMsisdn?: string;
+    note?: string;
+  }) => PaymentReminderRequestRecord | null;
 
   // Steps 1–7 Double-Entry Ledger, Period Close & Versioned Tax Engine
   ownerLedgerConfig: OwnerLedgerConfig;
@@ -4996,7 +5012,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
           label: `SMS ${input.triggerType} -> ${tenant.name}`,
           payload: { smsId: smsRecord.id },
         });
-      } else {
+      } else if (officeSessionRole !== 'tenant') {
         void postSmsDispatchToServer({
           ownerId: targetOwnerId,
           count: 1,
@@ -5010,6 +5026,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
       enqueueOfflineAction,
       isOnline,
       locale,
+      officeSessionRole,
       seed.charges,
       seed.maintenanceTickets,
       seed.tenantPrefs,
@@ -5519,6 +5536,215 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [dispatchAutomatedSmsReminder, enqueueOfflineAction, isOnline, notify, seed.charges, seed.receipts, seed.tenants]
   );
 
+  const requestTenantPaymentReminder = useCallback(
+    (input: {
+      tenantId: string;
+      chargeIds: string[];
+      channel: PaymentReminderChannel;
+      recipientEmail?: string;
+      recipientMsisdn?: string;
+      note?: string;
+    }): PaymentReminderRequestRecord | null => {
+      const tenant = seed.tenants.find((t) => t.id === input.tenantId);
+      if (!tenant) return null;
+
+      const selectedCharges = seed.charges.filter(
+        (c) =>
+          c.tenantId === input.tenantId &&
+          input.chargeIds.includes(c.id) &&
+          c.billedEtb > c.paidEtb
+      );
+      if (selectedCharges.length === 0) return null;
+
+      const targetOwnerId = tenant.ownerId;
+      const prefs = seed.tenantPrefs.find((p) => p.tenantId === tenant.id);
+      const effectiveLocale: UiLocale = prefs?.preferredLocale || locale;
+      const resolvedEmail = (input.recipientEmail ?? tenant.emailPlaceholder ?? '').trim();
+      const includesEmail = input.channel === 'Email' || input.channel === 'Email & Notification';
+      const includesNotification =
+        input.channel === 'Notification' || input.channel === 'Email & Notification';
+
+      if (includesEmail && !isValidEmailAddress(resolvedEmail)) {
+        notify({
+          tone: 'error',
+          title: biText(locale, 'Invalid Email Address', 'የተሳሳተ የኢሜይል አድራሻ'),
+          detail: biText(
+            locale,
+            'Enter a valid recipient email address for the payment reminder.',
+            'ለክፍያ ማሳሰቢያው ትክክለኛ የኢሜይል አድራሻ ያስገቡ።'
+          ),
+        });
+        return null;
+      }
+
+      const rawMsisdn =
+        input.recipientMsisdn?.trim() ||
+        prefs?.msisdn ||
+        tenant.phonePlaceholder.replace(/[^\d+]/g, '') ||
+        '+251910000001';
+      const maskedMsisdn = maskMsisdnForDisplay(rawMsisdn);
+      const tenantUnits = seed.units.filter((u) =>
+        selectedCharges.some((ch) => ch.unitId === u.id)
+      );
+      const unitLabel =
+        tenantUnits.map((u) => u.code).join(', ') ||
+        activeTenantAccount?.unitLabel ||
+        'Assigned Unit';
+
+      const copy = buildManualReminderCopy({
+        locale: effectiveLocale,
+        tenantName: tenant.name,
+        unitLabel,
+        charges: selectedCharges,
+        channel: input.channel,
+        recipientEmail: resolvedEmail || tenant.emailPlaceholder,
+        note: input.note,
+      });
+
+      const tsMs = Date.now();
+      const tsShort = nowTimestamp().slice(0, 16);
+      const deliveryStatus: PaymentReminderRequestRecord['deliveryStatus'] = isOnline
+        ? 'Delivered (Sandbox)'
+        : 'Queued Offline';
+
+      const reminderRecord: PaymentReminderRequestRecord = {
+        id: `REM-${tsMs}`,
+        ownerId: targetOwnerId,
+        tenantId: tenant.id,
+        chargeIds: selectedCharges.map((c) => c.id),
+        invoiceNumbers: selectedCharges.map((c) => c.invoiceNumber),
+        totalOpenEtb: copy.totalOpenEtb,
+        channel: input.channel,
+        recipientEmail: resolvedEmail || tenant.emailPlaceholder,
+        recipientMsisdn: includesNotification ? maskedMsisdn : undefined,
+        note: input.note?.trim() || undefined,
+        emailSubject: copy.emailSubject,
+        emailPreviewBody: copy.emailPreviewBody,
+        notificationBody: copy.notificationBody,
+        requestedAt: tsShort,
+        deliveryStatus,
+      };
+
+      const noticeRecord: TenantNoticeRecord = {
+        id: `NTC-REM-${tsMs.toString().slice(-6)}`,
+        ownerId: targetOwnerId,
+        tenantId: tenant.id,
+        titleEn: copy.noticeTitleEn,
+        titleAm: copy.noticeTitleAm,
+        bodyEn: copy.noticeBodyEn,
+        bodyAm: copy.noticeBodyAm,
+        category: 'Rent Reminder',
+        publishedAt: tsShort,
+        publishedBy: `${tenant.name} (Self-Requested)`,
+        readByTenantIds: [],
+      };
+
+      const smsRecord: SmsDispatchRecord | null = includesNotification
+        ? {
+            id: `SMS-REM-${tsMs}`,
+            ownerId: targetOwnerId,
+            tenantId: tenant.id,
+            recipientMsisdn: maskedMsisdn,
+            triggerType: 'Overdue Reminder',
+            locale: effectiveLocale,
+            messageBody: copy.notificationBody,
+            deliveryState: deliveryStatus,
+            dispatchedAt: tsShort,
+            channelMode: 'SANDBOX DISPATCH — NO LIVE TELCO',
+          }
+        : null;
+
+      const officeNotif: AppNotification = {
+        id: `NOTIF-REM-${tsMs}`,
+        ownerId: targetOwnerId,
+        title: `Manual Payment Reminder Requested (${input.channel})`,
+        detail: `${tenant.name} requested reminder for ${copy.invoiceList} (ETB ${copy.totalOpenEtb.toLocaleString()}).`,
+        targetSection: 'collections',
+        timestamp: tsShort,
+        read: false,
+      };
+
+      setSeed((prev) => ({
+        ...prev,
+        paymentReminderRequests: [reminderRecord, ...(prev.paymentReminderRequests || [])],
+        tenantNotices: [noticeRecord, ...prev.tenantNotices],
+        smsLogs: smsRecord ? [smsRecord, ...prev.smsLogs] : prev.smsLogs,
+        notifications: [officeNotif, ...prev.notifications],
+        auditEvents: [
+          {
+            id: `AUD-${9000 + prev.auditEvents.length + 1}`,
+            ownerId: targetOwnerId,
+            timestamp: nowTimestamp(),
+            actor: tenant.name,
+            actorId: tenant.id,
+            persona: 'Collections Clerk',
+            executionMode: 'Simulation',
+            module: 'Rent & Collections',
+            action: `Tenant Manual Payment Reminder Requested (${input.channel})`,
+            recordType: 'PaymentReminderRequest',
+            recordId: reminderRecord.id,
+            reason: `Tenant requested ${input.channel} reminder for missed deadline invoice(s): ${copy.invoiceList} (ETB ${copy.totalOpenEtb.toLocaleString()}).`,
+            evidenceRef: reminderRecord.id,
+          },
+          ...prev.auditEvents,
+        ],
+      }));
+
+      if (
+        includesNotification &&
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        window.Notification.permission === 'granted'
+      ) {
+        try {
+          new window.Notification(copy.noticeTitleEn, {
+            body: copy.notificationBody,
+          });
+        } catch {
+          // Ignore browser Notification constructor restrictions
+        }
+      }
+
+      if (!isOnline) {
+        enqueueOfflineAction({
+          ownerId: targetOwnerId,
+          type: 'sms',
+          label: `Reminder (${input.channel}) -> ${copy.invoiceList}`,
+          payload: { reminderId: reminderRecord.id },
+        });
+      } else {
+        publishRealtimeEvent({
+          type: 'notice:published',
+          ownerId: targetOwnerId,
+          data: { notice: noticeRecord, reminder: reminderRecord },
+        });
+      }
+
+      notify({
+        tone: 'success',
+        title: biText(
+          locale,
+          `Payment Reminder Sent (${input.channel})`,
+          `የክፍያ ማሳሰቢያ ተልኳል (${input.channel})`
+        ),
+        detail: `${copy.invoiceList} · ETB ${copy.totalOpenEtb.toLocaleString()} (${deliveryStatus})`,
+      });
+
+      return reminderRecord;
+    },
+    [
+      activeTenantAccount?.unitLabel,
+      enqueueOfflineAction,
+      isOnline,
+      locale,
+      notify,
+      seed.charges,
+      seed.tenantPrefs,
+      seed.tenants,
+      seed.units,
+    ]
+  );
+
   // Strictly isolated owner projections
   const activeOwner = useMemo(
     () => seed.owners.find((o) => o.id === activeOwnerId) || seed.owners[0],
@@ -5655,6 +5881,10 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const ownerTenantPrefs = useMemo(
     () => seed.tenantPrefs.filter((p) => p.ownerId === activeOwnerId),
     [seed.tenantPrefs, activeOwnerId]
+  );
+  const ownerPaymentReminderRequests = useMemo(
+    () => (seed.paymentReminderRequests || []).filter((r) => r.ownerId === activeOwnerId),
+    [seed.paymentReminderRequests, activeOwnerId]
   );
 
   const ownerOromifaTemplates = useMemo(
@@ -7082,6 +7312,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ownerTenantNotices,
     ownerSmsLogs,
     ownerTenantPrefs,
+    ownerPaymentReminderRequests,
     ownerOromifaTemplates,
     saveOromifaTemplate,
     deleteOromifaTemplate,
@@ -7164,6 +7395,7 @@ export const PrmsProvider: React.FC<{ children: React.ReactNode }> = ({ children
     dispatchBatchOverdueSmsReminders,
     updateTenantNotificationPrefs,
     submitTenantMobilePayment,
+    requestTenantPaymentReminder,
     ownerLedgerConfig,
     ownerLedgerAccountsV2,
     ownerAccountingPeriods,

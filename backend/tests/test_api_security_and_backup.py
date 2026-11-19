@@ -18,7 +18,7 @@ from apps.portfolio.models import OwnerEntity
 from scripts.verify_restore_reconciliation import run_reconciliation, validate_manifest_dict, verify_audit_chain
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_api_rbac_approval_forgery_protection_and_prod_ui(tmp_path):
     with transaction.atomic():
         owner = OwnerEntity.objects.create(

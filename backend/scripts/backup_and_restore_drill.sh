@@ -98,7 +98,7 @@ if [ -n "${VERIFY_RESTORE_DATABASE_URL:-}" ]; then
     -in "${ENC_DOCS_TAR}" -out "${VERIFY_DOCS_TAR}" -pass env:BACKUP_ENCRYPTION_PASSPHRASE
   tar -xzf "${VERIFY_DOCS_TAR}" -C "${VERIFY_DOCS_DIR}"
 
-  pg_restore --clean --if-exists --no-owner --dbname="${VERIFY_RESTORE_DATABASE_URL}" "${VERIFY_TMP}"
+  pg_restore --clean --if-exists --no-owner --no-privileges --dbname="${VERIFY_RESTORE_DATABASE_URL}" "${VERIFY_TMP}"
 
   echo "[6/6] Running post-restore business & cryptographic reconciliation..."
   DATABASE_URL="${VERIFY_RESTORE_DATABASE_URL}" python3 "${SCRIPT_DIR}/verify_restore_reconciliation.py" \

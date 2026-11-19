@@ -970,21 +970,16 @@ export async function createTrainingServerApp(options?: {
   const shouldAttachVite = options?.attachVite ?? !isProduction;
   if (shouldAttachVite) {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
         allowedHosts: true,
+        hmr: !disableHmr,
         ws: {
           server,
           path: '/vite-hmr',
         },
-        hmr:
-          process.env.DISABLE_HMR === 'true'
-            ? false
-            : {
-                server,
-                path: '/vite-hmr',
-              },
       },
       appType: 'spa',
     });
@@ -1009,6 +1004,10 @@ const isMainEntry =
 if (isMainEntry) {
   createTrainingServerApp()
     .then(({ server }) => {
+      server.on('error', (err) => {
+        console.error('AD-PRMS HTTP server error:', err);
+        process.exit(1);
+      });
       server.listen(PORT, BIND_HOST, () => {
         console.log(
           `AD-PRMS Office Test & Training Server (SQLite) listening on http://${BIND_HOST}:${PORT}`

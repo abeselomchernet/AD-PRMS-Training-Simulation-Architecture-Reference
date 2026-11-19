@@ -100,7 +100,7 @@ def test_erca_gate_blocks_active_tax_rule_without_four_signoffs():
     assert gate.can_activate_tax_rules() is True
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_single_title_holder_five_buildings_and_inter_entity_block():
     with transaction.atomic():
         owner = OwnerEntity.objects.create(
@@ -123,7 +123,7 @@ def test_single_title_holder_five_buildings_and_inter_entity_block():
             assert_inter_entity_posting_permitted(owner=owner, target_party_code='PARTY-TRADING-PENDING')
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_audit_event_hash_chain_and_rls_context_isolation():
     with transaction.atomic():
         owner_a = OwnerEntity.objects.create(

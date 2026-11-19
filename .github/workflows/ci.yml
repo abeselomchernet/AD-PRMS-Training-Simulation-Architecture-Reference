@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Pre-build health & environment check
+        run: ./check-health.sh --mode frontend
+
       - name: TypeScript type-check
         run: npm run lint
 
@@ -91,6 +94,13 @@ jobs:
           mkdir -p ci-reports
           psql -h 127.0.0.1 -U adprms_admin -d adprms -v ON_ERROR_STOP=1 -f backend/postgres/init_wp2_roles.sql
 
+      - name: Pre-migration PostgreSQL & environment health check
+        env:
+          DATABASE_URL: postgres://adprms_admin:wp2_admin_password@127.0.0.1:5432/adprms
+          DJANGO_SECRET_KEY: ci-verification-secret-key-not-prod
+          DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+        run: ./check-health.sh --mode postgres
+
       - name: Django system check & migration graph validation against PG 16
         working-directory: backend
         env:
@@ -130,7 +140,7 @@ jobs:
           DATABASE_URL=postgres://adprms_admin:wp2_admin_password@127.0.0.1:5432/test_adprms python3 backend/manage.py migrate --noinput
           psql -h 127.0.0.1 -U adprms_admin -d test_adprms -v ON_ERROR_STOP=1 -f backend/postgres/init_wp2_roles.sql
           cd backend
-          DATABASE_URL=postgres://adprms_app:CHANGE_ME_APP_PASS@127.0.0.1:5432/adprms pytest -v --reuse-db --no-migrations --junitxml=../ci-reports/backend-postgres-junit.xml
+          DATABASE_URL=postgres://adprms_app:CHANGE_ME_APP_PASS@127.0.0.1:5432/test_adprms DJANGO_USE_PREMIGRATED_TEST_DB=true pytest -v --junitxml=../ci-reports/backend-postgres-junit.xml
 
       - name: Run distinct SQLite Django pytest suite (separate from PostgreSQL evidence)
         working-directory: backend

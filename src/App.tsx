@@ -1,4 +1,5 @@
 import React, { Suspense, lazy } from 'react';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ThemeProvider } from './context/ThemeContext';
 import { PrmsProvider, usePrms } from './context/PrmsContext';
 import { AppShell } from './components/layout/AppShell';
@@ -250,10 +251,12 @@ const ActiveWorkspace: React.FC = () => {
 
 export default function App() {
   return (
-    <ThemeProvider>
-      <PrmsProvider>
-        <ActiveWorkspace />
-      </PrmsProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <PrmsProvider>
+          <ActiveWorkspace />
+        </PrmsProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

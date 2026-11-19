@@ -3,9 +3,11 @@ import QRCode from 'qrcode';
 import {
   AlertCircle,
   Bell,
+  BellRing,
   Building2,
   Camera,
   CheckCircle2,
+  Clock,
   CreditCard,
   Download,
   FileSpreadsheet,
@@ -13,6 +15,7 @@ import {
   Globe,
   Home,
   LogOut,
+  Mail,
   MessageSquare,
   Moon,
   Plus,
@@ -43,12 +46,26 @@ import {
   simulateArifPayHostedPayment,
   verifyArifPaySessionFallback,
 } from '../../services/arifpayGatewayService';
-import { ChargeRecord, DateDisplayMode, PaymentReceipt } from '../../types/prms';
+import {
+  ChargeRecord,
+  DateDisplayMode,
+  PaymentReceipt,
+  PaymentReminderChannel,
+  PaymentReminderRequestRecord,
+} from '../../types/prms';
 import {
   buildArifPayQrPayload,
   buildTelebirrQrPayload,
   ParsedPaymentQr,
 } from '../../utils/paymentQr';
+import {
+  buildManualReminderCopy,
+  getDaysPastDue,
+  getMissedDeadlineCharges,
+  getOpenBalanceEtb,
+  isChargeMissedDeadline,
+  isValidEmailAddress,
+} from '../../utils/paymentReminders';
 import { downloadExportFile } from '../../utils/exportDownload';
 import { OfflineIndicator, PWAInstallButton } from '../pwa/PWAInstallButton';
 import { BottomSheet } from './BottomSheet';
@@ -75,12 +92,14 @@ export const TenantMobileApp: React.FC = () => {
     ownerTenantNotices,
     ownerSmsLogs,
     ownerTenantPrefs,
+    ownerPaymentReminderRequests,
     logoutTenant,
     sendMaintenanceMessage,
     createTenantMaintenanceTicket,
     markTenantNoticeRead,
     updateTenantNotificationPrefs,
     submitTenantMobilePayment,
+    requestTenantPaymentReminder,
     locale,
     setLocale,
     dateMode,
@@ -117,6 +136,17 @@ export const TenantMobileApp: React.FC = () => {
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [qrScanBanner, setQrScanBanner] = useState<string | null>(null);
   const [historyExportMessage, setHistoryExportMessage] = useState<string | null>(null);
+
+  // Manual Payment Reminder Sheet (missed-deadline invoices)
+  const [reminderSheetOpen, setReminderSheetOpen] = useState(false);
+  const [reminderChargeIds, setReminderChargeIds] = useState<string[]>([]);
+  const [reminderChannel, setReminderChannel] = useState<PaymentReminderChannel>('Email & Notification');
+  const [reminderEmail, setReminderEmail] = useState('');
+  const [reminderNote, setReminderNote] = useState('');
+  const [reminderErrors, setReminderErrors] = useState<string[]>([]);
+  const [submittedReminder, setSubmittedReminder] = useState<PaymentReminderRequestRecord | null>(
+    null
+  );
 
   // Receipt Preview Sheet
   const [previewReceipt, setPreviewReceipt] = useState<PaymentReceipt | null>(null);
@@ -328,6 +358,45 @@ export const TenantMobileApp: React.FC = () => {
     () => ownerSmsLogs.filter((s) => s.tenantId === tenantId),
     [ownerSmsLogs, tenantId]
   );
+  const myMissedDeadlineCharges = useMemo(
+    () => getMissedDeadlineCharges(myCharges),
+    [myCharges]
+  );
+  const myMissedTotalEtb = useMemo(
+    () => myMissedDeadlineCharges.reduce((sum, ch) => sum + getOpenBalanceEtb(ch), 0),
+    [myMissedDeadlineCharges]
+  );
+  const myReminderRequests = useMemo(
+    () => ownerPaymentReminderRequests.filter((r) => r.tenantId === tenantId),
+    [ownerPaymentReminderRequests, tenantId]
+  );
+  const reminderSelectedCharges = useMemo(
+    () => myMissedDeadlineCharges.filter((ch) => reminderChargeIds.includes(ch.id)),
+    [myMissedDeadlineCharges, reminderChargeIds]
+  );
+  const reminderPreview = useMemo(() => {
+    if (reminderSelectedCharges.length === 0) return null;
+    return buildManualReminderCopy({
+      locale,
+      tenantName: tenantRecord?.name || activeTenantAccount?.displayName || tenantId,
+      unitLabel: activeTenantAccount?.unitLabel || 'Assigned Unit',
+      charges: reminderSelectedCharges,
+      channel: reminderChannel,
+      recipientEmail: reminderEmail.trim() || tenantRecord?.emailPlaceholder || 'tenant@synthetic.example.et',
+      note: reminderNote,
+    });
+  }, [
+    activeTenantAccount?.displayName,
+    activeTenantAccount?.unitLabel,
+    locale,
+    reminderChannel,
+    reminderEmail,
+    reminderNote,
+    reminderSelectedCharges,
+    tenantId,
+    tenantRecord?.emailPlaceholder,
+    tenantRecord?.name,
+  ]);
   const myPrefs = useMemo(
     () =>
       ownerTenantPrefs.find((p) => p.tenantId === tenantId) || {
@@ -403,6 +472,67 @@ export const TenantMobileApp: React.FC = () => {
     setQrScanBanner(null);
     setTelebirrSession(null);
     setArifpaySession(null);
+  };
+
+  const openReminderSheet = (targetChargeId?: string) => {
+    const defaultIds = targetChargeId
+      ? [targetChargeId]
+      : myMissedDeadlineCharges.map((ch) => ch.id);
+    setReminderChargeIds(defaultIds);
+    setReminderChannel('Email & Notification');
+    setReminderEmail(tenantRecord?.emailPlaceholder || '');
+    setReminderNote('');
+    setReminderErrors([]);
+    setSubmittedReminder(null);
+    setReminderSheetOpen(true);
+  };
+
+  const toggleReminderChargeId = (chargeId: string) => {
+    setReminderErrors([]);
+    setReminderChargeIds((prev) =>
+      prev.includes(chargeId) ? prev.filter((id) => id !== chargeId) : [...prev, chargeId]
+    );
+  };
+
+  const handleSubmitReminderRequest = (e: React.FormEvent) => {
+    e.preventDefault();
+    const errs: string[] = [];
+    if (reminderChargeIds.length === 0) {
+      errs.push(
+        biText(
+          locale,
+          'Select at least one missed-deadline invoice for the reminder.',
+          'ለማሳሰቢያው ቢያንስ አንድ ቀነ-ገደቡ ያለፈ ደረሰኝ ይምረጡ።'
+        )
+      );
+    }
+    const needsEmail = reminderChannel === 'Email' || reminderChannel === 'Email & Notification';
+    if (needsEmail && !isValidEmailAddress(reminderEmail)) {
+      errs.push(
+        biText(
+          locale,
+          'Enter a valid email address to receive the payment reminder.',
+          'የክፍያ ማሳሰቢያውን ለመቀበል ትክክለኛ የኢሜይል አድራሻ ያስገቡ።'
+        )
+      );
+    }
+    if (errs.length > 0) {
+      setReminderErrors(errs);
+      return;
+    }
+
+    const created = requestTenantPaymentReminder({
+      tenantId,
+      chargeIds: reminderChargeIds,
+      channel: reminderChannel,
+      recipientEmail: reminderEmail.trim(),
+      recipientMsisdn: myPrefs.msisdn,
+      note: reminderNote.trim(),
+    });
+    if (created) {
+      setReminderErrors([]);
+      setSubmittedReminder(created);
+    }
   };
 
   const matchQrToInvoice = (parsed: ParsedPaymentQr) => {
@@ -1003,12 +1133,96 @@ export const TenantMobileApp: React.FC = () => {
               </button>
             </section>
 
+            {/* Missed-Deadline Manual Reminder Action Card */}
+            {myMissedDeadlineCharges.length > 0 && (
+              <section
+                data-testid="missed-deadline-reminder-card"
+                className="rounded-2xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-300 dark:border-amber-700/60 p-4 space-y-3"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    <p className="text-xs font-bold text-[#0F233A] dark:text-amber-200 flex items-center gap-1.5">
+                      <Clock className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0" />
+                      <span>
+                        {biText(locale, 'Missed Payment Deadline', 'ያለፈ የክፍያ ቀነ-ገደብ')}
+                      </span>
+                    </p>
+                    <p className="text-xs text-slate-700 dark:text-slate-300 tabular-nums">
+                      {biText(
+                        locale,
+                        `${myMissedDeadlineCharges.length} invoice(s) past due · ${fmtEtb(myMissedTotalEtb)} open. Need a reminder sent to your email or notifications?`,
+                        `${myMissedDeadlineCharges.length} ደረሰኝ(ዎች) ቀነ-ገደብ አልፏል · ${fmtEtb(myMissedTotalEtb)} ቀሪ። ወደ ኢሜይልዎ ወይም ማሳወቂያ ማሳሰቢያ እንዲላክ ይፈልጋሉ?`
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="open-payment-reminder-sheet-btn"
+                    onClick={() => openReminderSheet()}
+                    className="flex-1 min-h-[44px] px-3.5 rounded-xl bg-[#0F233A] hover:bg-[#173252] dark:bg-[#C28A24] dark:hover:bg-[#AD791D] text-white dark:text-slate-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Mail className="w-4 h-4 shrink-0" />
+                    <span>
+                      {biText(
+                        locale,
+                        'Request Payment Reminder',
+                        'የክፍያ ማሳሰቢያ ጠይቅ'
+                      )}
+                    </span>
+                  </button>
+                </div>
+
+                {myReminderRequests.length > 0 && (
+                  <div
+                    data-testid="latest-reminder-confirmation"
+                    className="rounded-xl bg-white/90 dark:bg-[#111C2C] border border-amber-200 dark:border-amber-800/50 p-3 space-y-1 text-[11px]"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-[#166549] dark:text-emerald-400 flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>
+                          {biText(locale, 'Reminder Requested', 'ማሳሰቢያ ተጠይቋል')} ·{' '}
+                          {myReminderRequests[0].channel}
+                        </span>
+                      </span>
+                      <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                        {fmtDateTime(myReminderRequests[0].requestedAt)}
+                      </span>
+                    </div>
+                    <p className="text-slate-700 dark:text-slate-300 font-mono">
+                      {myReminderRequests[0].invoiceNumbers.join(', ')} ·{' '}
+                      {myReminderRequests[0].channel === 'Notification'
+                        ? myReminderRequests[0].recipientMsisdn
+                        : myReminderRequests[0].recipientEmail}
+                    </p>
+                    <div className="flex items-center justify-between gap-2 pt-0.5">
+                      <span className="text-slate-500 dark:text-slate-400">
+                        {myReminderRequests[0].deliveryStatus}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('notices')}
+                        className="font-semibold text-[#166549] dark:text-emerald-400 hover:underline cursor-pointer"
+                      >
+                        {biText(locale, 'Open Notices', 'ማስታወቂያዎችን ክፈት')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+
             <section className="space-y-2.5">
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
                 {biText(locale, 'My Invoices', 'የእኔ ደረሰኞች')} ({myCharges.length})
               </h2>
               {myCharges.map((ch) => {
                 const due = Math.max(0, ch.billedEtb - ch.paidEtb);
+                const missedDeadline = isChargeMissedDeadline(ch);
+                const daysLate = missedDeadline ? getDaysPastDue(ch.dueDate) : 0;
                 return (
                   <div
                     key={ch.id}
@@ -1019,8 +1233,13 @@ export const TenantMobileApp: React.FC = () => {
                         <p className="font-mono text-xs font-bold text-[#0F233A] dark:text-[#E5B85C]">
                           {ch.invoiceNumber}
                         </p>
-                        <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                        <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5 tabular-nums">
                           {ch.period} · {biText(locale, 'Due', 'መክፈያ')} {fmtDate(ch.dueDate)}
+                          {missedDeadline && daysLate > 0 && (
+                            <span className="ml-1.5 font-semibold text-amber-700 dark:text-amber-300">
+                              · {daysLate}d {biText(locale, 'past due', 'ያለፈበት')}
+                            </span>
+                          )}
                         </p>
                       </div>
                       <StatusLabel label={ch.status} />
@@ -1042,14 +1261,33 @@ export const TenantMobileApp: React.FC = () => {
                       </div>
                     </div>
                     {due > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => openCheckout(ch)}
-                        className="w-full min-h-[44px] rounded-xl bg-[#166549] hover:bg-[#12533B] text-white text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
-                      >
-                        <QrCode className="w-4 h-4" />
-                        <span>{biText(locale, 'Pay via Telebirr / ArifPay / CBE', 'በቴሌብር / አሪፍፔይ / ንግድ ባንክ ክፈል')}</span>
-                      </button>
+                      <div className="space-y-2">
+                        <button
+                          type="button"
+                          onClick={() => openCheckout(ch)}
+                          className="w-full min-h-[44px] rounded-xl bg-[#166549] hover:bg-[#12533B] text-white text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          <QrCode className="w-4 h-4" />
+                          <span>{biText(locale, 'Pay via Telebirr / ArifPay / CBE', 'በቴሌብር / አሪፍፔይ / ንግድ ባንክ ክፈል')}</span>
+                        </button>
+                        {missedDeadline && (
+                          <button
+                            type="button"
+                            data-testid={`request-reminder-btn-${ch.invoiceNumber}`}
+                            onClick={() => openReminderSheet(ch.id)}
+                            className="w-full min-h-[44px] rounded-xl border border-[#CBD5E1] dark:border-[#2D405B] bg-[#F8FAFC] dark:bg-[#152236] hover:bg-slate-100 dark:hover:bg-[#1D2E48] text-[#0F233A] dark:text-slate-100 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+                          >
+                            <BellRing className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0" />
+                            <span>
+                              {biText(
+                                locale,
+                                'Request Reminder Email / Notification',
+                                'የክፍያ ማሳሰቢያ ኢሜይል / ማሳወቂያ ጠይቅ'
+                              )}
+                            </span>
+                          </button>
+                        )}
+                      </div>
                     )}
                   </div>
                 );
@@ -2087,6 +2325,265 @@ export const TenantMobileApp: React.FC = () => {
         matchInvoice={matchQrToInvoice}
         locale={locale}
       />
+
+      {/* Manual Payment Reminder Request BottomSheet */}
+      <BottomSheet
+        open={reminderSheetOpen}
+        onClose={() => {
+          setReminderSheetOpen(false);
+          setSubmittedReminder(null);
+        }}
+        title={biText(locale, 'Request Payment Reminder', 'የክፍያ ማሳሰቢያ ጠይቅ')}
+        subtitle={biText(
+          locale,
+          'Sandbox Email & App/SMS Notification — No Live SMTP or Telco',
+          'የሙከራ ኢሜይል እና የመተግበሪያ/SMS ማሳወቂያ — ቀጥተኛ ስርጭት የለም'
+        )}
+      >
+        {submittedReminder ? (
+          <div data-testid="reminder-sent-confirmation" className="space-y-4 text-xs">
+            <div className="rounded-xl border border-emerald-300 dark:border-emerald-700/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3.5 space-y-1.5">
+              <p className="font-bold text-emerald-900 dark:text-emerald-200 flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4 text-[#166549] dark:text-emerald-400 shrink-0" />
+                <span>
+                  {biText(
+                    locale,
+                    `Reminder Dispatched (${submittedReminder.channel})`,
+                    `ማሳሰቢያ ተልኳል (${submittedReminder.channel})`
+                  )}
+                </span>
+              </p>
+              <p className="text-emerald-800 dark:text-emerald-300 tabular-nums">
+                {submittedReminder.invoiceNumbers.join(', ')} · {fmtEtb(submittedReminder.totalOpenEtb)} ·{' '}
+                {submittedReminder.deliveryStatus}
+              </p>
+            </div>
+
+            <div className="rounded-xl bg-[#F8FAFC] dark:bg-[#152236] border border-[#DFE5EE] dark:border-[#233349] p-3.5 space-y-2">
+              <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+                {submittedReminder.emailSubject}
+              </p>
+              {(submittedReminder.channel === 'Email' ||
+                submittedReminder.channel === 'Email & Notification') && (
+                <p className="text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                  {biText(locale, 'Email To:', 'ኢሜይል፡')} {submittedReminder.recipientEmail}
+                </p>
+              )}
+              {submittedReminder.recipientMsisdn && (
+                <p className="text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                  {biText(locale, 'Alert Target:', 'የማሳወቂያ መድረሻ፡')} {submittedReminder.recipientMsisdn}
+                </p>
+              )}
+              <pre className="whitespace-pre-wrap font-sans text-[11px] leading-relaxed text-slate-700 dark:text-slate-300 pt-1 border-t border-slate-200 dark:border-[#233349]">
+                {submittedReminder.channel === 'Notification'
+                  ? submittedReminder.notificationBody
+                  : submittedReminder.emailPreviewBody}
+              </pre>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setReminderSheetOpen(false);
+                  setSubmittedReminder(null);
+                  setActiveTab('notices');
+                }}
+                className="min-h-[44px] rounded-xl border border-[#CBD5E1] dark:border-[#2D405B] font-semibold text-[#0F233A] dark:text-slate-100 cursor-pointer"
+              >
+                {biText(locale, 'View in Notices', 'በማስታወቂያ እይ')}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setReminderSheetOpen(false);
+                  setSubmittedReminder(null);
+                }}
+                className="min-h-[44px] rounded-xl bg-[#166549] hover:bg-[#12533B] text-white font-semibold cursor-pointer"
+              >
+                {biText(locale, 'Done', 'ተጠናቋል')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <form noValidate onSubmit={handleSubmitReminderRequest} className="space-y-4 text-xs">
+            <ValidationSummary errors={reminderErrors} />
+
+            <div className="space-y-2">
+              <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+                {biText(locale, '1. Missed-Deadline Invoice(s)', '1. ቀነ-ገደባቸው ያለፈ ደረሰኞች')}
+              </p>
+              <div className="space-y-2 max-h-44 overflow-y-auto pr-0.5">
+                {myMissedDeadlineCharges.map((ch) => {
+                  const openEtb = getOpenBalanceEtb(ch);
+                  const checked = reminderChargeIds.includes(ch.id);
+                  const daysLate = getDaysPastDue(ch.dueDate);
+                  return (
+                    <label
+                      key={ch.id}
+                      className={`min-h-[44px] flex items-center justify-between gap-3 p-3 rounded-xl border cursor-pointer ${
+                        checked
+                          ? 'border-[#166549] bg-emerald-50/60 dark:bg-emerald-950/25'
+                          : 'border-[#DFE5EE] dark:border-[#233349] bg-[#F8FAFC] dark:bg-[#152236]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleReminderChargeId(ch.id)}
+                          className="w-4 h-4 shrink-0 accent-[#166549]"
+                        />
+                        <div className="min-w-0">
+                          <p className="font-mono font-bold text-[#0F233A] dark:text-[#E5B85C] truncate">
+                            {ch.invoiceNumber}
+                          </p>
+                          <p className="text-[11px] text-slate-600 dark:text-slate-300 tabular-nums">
+                            {biText(locale, 'Due', 'መክፈያ')} {fmtDate(ch.dueDate)}
+                            {daysLate > 0 ? ` · ${daysLate}d` : ''}
+                          </p>
+                        </div>
+                      </div>
+                      <span className="font-mono font-bold tabular-nums text-[#0F233A] dark:text-slate-100 shrink-0">
+                        {fmtEtb(openEtb)}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+                {biText(locale, '2. Delivery Channel', '2. የመላኪያ መንገድ')}
+              </p>
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    {
+                      id: 'Email',
+                      testId: 'reminder-channel-email',
+                      labelEn: 'Email',
+                      labelAm: 'ኢሜይል',
+                      icon: Mail,
+                    },
+                    {
+                      id: 'Notification',
+                      testId: 'reminder-channel-notification',
+                      labelEn: 'Notification',
+                      labelAm: 'ማሳወቂያ',
+                      icon: Bell,
+                    },
+                    {
+                      id: 'Email & Notification',
+                      testId: 'reminder-channel-both',
+                      labelEn: 'Both',
+                      labelAm: 'ሁለቱም',
+                      icon: BellRing,
+                    },
+                  ] as const
+                ).map((opt) => {
+                  const Icon = opt.icon;
+                  const active = reminderChannel === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      data-testid={opt.testId}
+                      onClick={() => {
+                        setReminderChannel(opt.id);
+                        setReminderErrors([]);
+                      }}
+                      className={`min-h-[44px] px-2 rounded-xl border font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer ${
+                        active
+                          ? 'border-[#166549] bg-emerald-50/70 dark:bg-emerald-950/30 text-[#166549] dark:text-emerald-300'
+                          : 'border-[#DFE5EE] dark:border-[#233349] text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      <Icon className="w-3.5 h-3.5 shrink-0" />
+                      <span>{biText(locale, opt.labelEn, opt.labelAm)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {(reminderChannel === 'Email' || reminderChannel === 'Email & Notification') && (
+              <div>
+                <label htmlFor="reminder-email-input" className="block font-semibold mb-1">
+                  {biText(locale, 'Recipient Email *', 'ተቀባይ ኢሜይል *')}
+                </label>
+                <input
+                  id="reminder-email-input"
+                  type="email"
+                  value={reminderEmail}
+                  onChange={(e) => setReminderEmail(e.target.value)}
+                  placeholder="tenant.demo@synthetic.example.et"
+                  className="w-full min-h-[44px] px-3 rounded-xl border border-[#CBD5E1] dark:border-[#2D405B] bg-[#F8FAFC] dark:bg-[#152236] font-mono"
+                />
+              </div>
+            )}
+
+            {(reminderChannel === 'Notification' || reminderChannel === 'Email & Notification') && (
+              <div className="rounded-xl bg-[#F8FAFC] dark:bg-[#152236] border border-[#DFE5EE] dark:border-[#233349] p-3 text-[11px] text-slate-600 dark:text-slate-300 space-y-0.5">
+                <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+                  {biText(locale, 'App Notice & SMS Sandbox Target', 'የመተግበሪያ እና SMS ማሳወቂያ መድረሻ')}
+                </p>
+                <p className="font-mono">
+                  {myPrefs.msisdn} · {biText(locale, 'Notices Tab + Office Collections Alert', 'የማስታወቂያ ዝርዝር + የቢሮ ማንቂያ')}
+                </p>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="reminder-note-input" className="block font-semibold mb-1">
+                {biText(locale, 'Optional Note / Planned Payment Date', 'አማራጭ ማስታወሻ / የመክፈያ ቀን እቅድ')}
+              </label>
+              <input
+                id="reminder-note-input"
+                type="text"
+                value={reminderNote}
+                onChange={(e) => setReminderNote(e.target.value)}
+                placeholder={biText(
+                  locale,
+                  'e.g. Will settle via Telebirr this Friday',
+                  'ለምሳሌ፡ አርብ በቴሌብር እከፍላለሁ'
+                )}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-[#CBD5E1] dark:border-[#2D405B] bg-[#F8FAFC] dark:bg-[#152236]"
+              />
+            </div>
+
+            {reminderPreview && (
+              <div className="rounded-xl bg-[#F8FAFC] dark:bg-[#152236] border border-[#DFE5EE] dark:border-[#233349] p-3 space-y-1 text-[11px]">
+                <p className="font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider text-[10px]">
+                  {biText(locale, 'Sandbox Reminder Preview', 'የማሳሰቢያ ቅድመ-ዕይታ')}
+                </p>
+                <p className="font-semibold text-[#0F233A] dark:text-slate-100">
+                  {reminderPreview.emailSubject}
+                </p>
+                <p className="text-slate-600 dark:text-slate-300">
+                  {reminderPreview.notificationBody}
+                </p>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              data-testid="submit-payment-reminder-btn"
+              className="w-full min-h-[44px] rounded-xl bg-[#166549] hover:bg-[#12533B] text-white font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Send className="w-4 h-4 shrink-0" />
+              <span>
+                {biText(
+                  locale,
+                  'Send Payment Reminder Now',
+                  'የክፍያ ማሳሰቢያውን አሁን ላክ'
+                )}
+              </span>
+            </button>
+          </form>
+        )}
+      </BottomSheet>
 
       {/* Toasts */}
       {toasts.length > 0 && (
