@@ -274,7 +274,11 @@ print(f"{host}|{port}|{dbname}|{user}")
   echo "[INFO] Target PostgreSQL: host=$pg_host port=$pg_port db=$pg_db user=${pg_user:-<default>}"
 
   if command -v pg_isready >/dev/null 2>&1; then
-    if pg_isready -h "$pg_host" -p "$pg_port" -d "$pg_db" >/dev/null 2>&1; then
+    local pg_isready_args=(-h "$pg_host" -p "$pg_port" -d "$pg_db")
+    if [[ -n "$pg_user" ]]; then
+      pg_isready_args+=(-U "$pg_user")
+    fi
+    if pg_isready "${pg_isready_args[@]}" >/dev/null 2>&1; then
       pass "pg_isready succeeded for $pg_host:$pg_port/$pg_db"
     else
       fail "pg_isready failed for $pg_host:$pg_port/$pg_db"

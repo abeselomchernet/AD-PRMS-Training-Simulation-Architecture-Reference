@@ -28,7 +28,7 @@ jobs:
         run: npm ci
 
       - name: Pre-build health & environment check
-        run: ./check-health.sh --mode frontend
+        run: bash ./check-health.sh --mode frontend
 
       - name: TypeScript type-check
         run: npm run lint
@@ -37,7 +37,9 @@ jobs:
         run: python3 -m compileall -q backend
 
       - name: Run unit & HTTP security tests (Vitest)
-        run: npx vitest run --reporter=default --reporter=junit --outputFile=ci-reports/vitest-junit.xml
+        run: |
+          mkdir -p ci-reports
+          npx vitest run --reporter=default --reporter=junit --outputFile=ci-reports/vitest-junit.xml
 
       - name: Build production bundle
         run: npm run build
@@ -99,7 +101,7 @@ jobs:
           DATABASE_URL: postgres://adprms_admin:wp2_admin_password@127.0.0.1:5432/adprms
           DJANGO_SECRET_KEY: ci-verification-secret-key-not-prod
           DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,testserver
-        run: ./check-health.sh --mode postgres
+        run: bash ./check-health.sh --mode postgres
 
       - name: Django system check & migration graph validation against PG 16
         working-directory: backend
@@ -160,9 +162,10 @@ jobs:
           BACKUP_ENCRYPTION_KEY_ID: ci-ephemeral-key-01
           BACKUP_DIR: ci-reports/backups
         run: |
+          set -eo pipefail
           psql -h 127.0.0.1 -U adprms_admin -d adprms -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS restore_verify_db;"
           psql -h 127.0.0.1 -U adprms_admin -d adprms -v ON_ERROR_STOP=1 -c "CREATE DATABASE restore_verify_db OWNER adprms_admin;"
-          ./backend/scripts/backup_and_restore_drill.sh | tee ci-reports/restore-drill.log
+          bash ./backend/scripts/backup_and_restore_drill.sh | tee ci-reports/restore-drill.log
 
       - name: Upload PostgreSQL 16, migration, WP-2 & restore artifacts
         if: always()
