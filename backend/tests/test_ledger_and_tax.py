@@ -96,7 +96,7 @@ def test_workpaper_confirmed_plc_and_requires_four_signoffs():
 
 
 @pytest.mark.django_db
-def test_historical_tax_rule_pack_effective_dates_and_reproducibility():
+def test_historical_tax_rule_pack_effective_dates_and_reproducibility(django_db):
     TaxRulePack.objects.create(
         pack_id='PACK-2025-LEGACY',
         version=1,
@@ -135,11 +135,12 @@ def test_historical_tax_rule_pack_effective_dates_and_reproducibility():
 
 
 @pytest.mark.django_db
-def test_pr08_failed_gateway_and_sod_reversal_guards():
-    dummy_owner = OwnerEntity(id=uuid.uuid4(), code='OWN-UNIT', name='Unit Owner', entity_type='Individual', effective_date=date(2026, 1, 1))
+def test_pr08_failed_gateway_and_sod_reversal_guards(django_db):
+    base_owner = django_db['owner']
+    base_actor = django_db['user'].actor_id
     res = post_ledger_event(
-        owner=dummy_owner,
-        period_code='2019-03',
+        owner=base_owner,
+        period_code=django_db['period'].period_code,
         entry_date=date(2026, 11, 24),
         rule_id='PR-08',
         source_type='GatewayAttempt',
@@ -147,32 +148,27 @@ def test_pr08_failed_gateway_and_sod_reversal_guards():
         idempotency_key='UNIT-PR08-E1',
         description='Failed Telebirr E1',
         lines=[],
-        maker_actor_id='ACT-COL-01',
+        maker_actor_id=base_actor,
     )
     assert res is None
 
-    dummy_entry = JournalEntry(id=uuid.uuid4(), owner=dummy_owner, journal_number='J15', maker_actor_id='ACT-FIN-01')
+    dummy_entry = JournalEntry(id=uuid.uuid4(), owner=base_owner, journal_number='J15', maker_actor_id=base_actor)
     with pytest.raises(ValidationError):
         reverse_journal_entry(
             original_entry=dummy_entry,
-            period_code='2019-03',
+            period_code=django_db['period'].period_code,
             reversal_date=date(2026, 11, 25),
             reason='Self reversal check',
-            maker_actor_id='ACT-FIN-01',
-            checker_actor_id='ACT-FIN-01',
+            maker_actor_id=base_actor,
+            checker_actor_id=base_actor,
         )
 
 
 @pytest.mark.django_db
-def test_ledger_posting_idempotency_period_lock_cash_cap_and_independent_3way_deposit():
+def test_ledger_posting_idempotency_period_lock_cash_cap_and_independent_3way_deposit(django_db):
     with transaction.atomic():
-        owner = OwnerEntity.objects.create(
-            code='OWN-LED-TEST',
-            name='Ledger Test Owner',
-            entity_type='Undetermined',
-            effective_date=date(2026, 1, 1),
-        )
-        bind_postgres_rls_owner('OWN-LED-TEST')
+        owner = django_db['owner']
+        bind_postgres_rls_owner(owner.code)
 
         Ledger.objects.create(
             owner=owner,
@@ -180,16 +176,7 @@ def test_ledger_posting_idempotency_period_lock_cash_cap_and_independent_3way_de
             enforce_daily_cash_cap=True,
             daily_cash_cap_etb=Decimal('50000.00'),
         )
-        open_period = AccountingPeriod.objects.create(
-            owner=owner,
-            fiscal_year_ec=2019,
-            month_index=3,
-            period_code='2019-03',
-            month_name_en='Hidar',
-            start_date_gc=date(2026, 11, 10),
-            end_date_gc=date(2026, 12, 9),
-            status=AccountingPeriod.Status.OPEN,
-        )
+        open_period = django_db['period']
         closed_period = AccountingPeriod.objects.create(
             owner=owner,
             fiscal_year_ec=2019,

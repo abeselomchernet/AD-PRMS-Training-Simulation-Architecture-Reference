@@ -101,15 +101,10 @@ def test_erca_gate_blocks_active_tax_rule_without_four_signoffs():
 
 
 @pytest.mark.django_db
-def test_single_title_holder_five_buildings_and_inter_entity_block():
+def test_single_title_holder_five_buildings_and_inter_entity_block(django_db):
     with transaction.atomic():
-        owner = OwnerEntity.objects.create(
-            code='OWN-DEKEBO',
-            name='Abdulwehab Dekebo',
-            entity_type='Undetermined',
-            effective_date=date(2026, 1, 1),
-        )
-        bind_postgres_rls_owner('OWN-DEKEBO')
+        owner = django_db['owner']
+        bind_postgres_rls_owner(owner.code)
         result = seed_single_title_holder_portfolio(owner_code=owner.code)
         assert result['title_holder'].legal_name == 'Abdulwehab Dekebo'
         assert len(result['buildings']) == 5
@@ -124,14 +119,9 @@ def test_single_title_holder_five_buildings_and_inter_entity_block():
 
 
 @pytest.mark.django_db
-def test_audit_event_hash_chain_and_rls_context_isolation():
+def test_audit_event_hash_chain_and_rls_context_isolation(django_db):
     with transaction.atomic():
-        owner_a = OwnerEntity.objects.create(
-            code='OWN-GOV-A',
-            name='Owner A',
-            entity_type='Individual',
-            effective_date=date(2026, 1, 1),
-        )
+        owner_a = django_db['owner']
         owner_b = OwnerEntity.objects.create(
             code='OWN-GOV-B',
             name='Owner B',
@@ -139,10 +129,10 @@ def test_audit_event_hash_chain_and_rls_context_isolation():
             effective_date=date(2026, 1, 1),
         )
 
-        bind_postgres_rls_owner('OWN-GOV-A')
+        bind_postgres_rls_owner(owner_a.code)
         ev1 = AuditEvent.objects.create(
             owner=owner_a,
-            actor_id='ACT-1',
+            actor_id=django_db['user'].actor_id,
             persona='Finance Officer',
             module='Ledger',
             action='Create',

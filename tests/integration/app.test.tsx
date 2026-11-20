@@ -452,4 +452,81 @@ describe('AD-PRMS Application Integration Flows', () => {
       await screen.findByText(/Payment Reminder Sent \(Email & Notification\) — INV-SYNTH-A-1101/i)
     ).toBeInTheDocument();
   }, 15_000);
+
+  it('renders SystemDemonstrationPage with Maker-Checker & Tenant Collection walkthroughs, Amharic Executive Mode, and live handoff', async () => {
+    render(<App />);
+
+    const useButtons = screen.getAllByRole('button', { name: /Use Credentials/i });
+    fireEvent.click(useButtons[0]); // gm.demo
+    fireEvent.click(screen.getByRole('button', { name: /Sign In to Training Session/i }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /System Demonstration/i }));
+    expect(await screen.findByTestId('walkthrough-scene-player', {}, { timeout: 5000 })).toBeInTheDocument();
+
+    // Verify horizontal scrollable chapter navigation tabs (Owner, GM, Finance Head, Clerk)
+    const tabRail = screen.getByTestId('horizontal-chapter-tabs');
+    expect(tabRail.className).toContain('overflow-x-auto');
+    expect(screen.getByRole('tab', { name: /^Owner/i })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^GM/i })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^Finance Head/i })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^Clerk/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: /^Owner/i }));
+    expect(
+      screen.getAllByText(/Owner 5-Building Isolation & Out-of-Office Mobile Mode/i).length
+    ).toBeGreaterThan(0);
+
+    // Switch back to All Chapters and verify Maker-Checker Approval & Self-Void Guard
+    fireEvent.click(screen.getByRole('tab', { name: /^All Chapters/i }));
+    expect(
+      screen.getAllByText(/Maker-Checker Approval & Self-Void Guard/i).length
+    ).toBeGreaterThan(0);
+
+    // Toggle to reusable lazy-loading VideoPlayer mode and back
+    fireEvent.click(screen.getByRole('button', { name: /Video Explainer Player/i }));
+    expect(await screen.findByTestId('custom-video-player')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Interactive Walkthrough/i }));
+
+    // Exercise interactive Maker-Checker simulation + PresentationCues overlay
+    expect(screen.getByTestId('maker-checker-interactive-sim')).toBeInTheDocument();
+    expect(screen.getByTestId('presentation-cues-panel')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Submit as Clerk \(Maker\)/i }));
+    expect(
+      (await screen.findAllByText(/Self-Approval Hard-Blocked by Actor ID/i)).length
+    ).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /Open Overlay View/i }));
+    expect(screen.getByTestId('presentation-cues-overlay')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Close presenter overlay/i }));
+
+    // Verify progress tracker & live walkthrough status on Curated System Walkthroughs
+    expect(screen.getByTestId('demo-progress-tracker')).toBeInTheDocument();
+    expect(screen.getByTestId('walkthrough-live-status-demo-maker-checker')).toBeInTheDocument();
+
+    // Open Transcript panel and verify Amharic & English script toggles dynamically
+    fireEvent.click(screen.getByTestId('transcript-toggle-btn'));
+    expect(screen.getByTestId('demo-transcript-panel')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('progress-chapter-owner'));
+    expect(screen.getByTestId('demo-progress-summary').textContent).toContain('1 / 4');
+
+    // Switch to Amharic Executive Mode in one click
+    fireEvent.click(screen.getByRole('button', { name: /Amharic Executive Mode/i }));
+    expect(
+      await screen.findByText(/የመጀመሪያ የአማርኛ የሥርዓት ማቅረቢያና የቪዲዮ መቅረጫ ስቱዲዮ/i)
+    ).toBeInTheDocument();
+
+    // Filter to Clerks chapter and select Tenant Rental Collection
+    fireEvent.click(screen.getByRole('tab', { name: /ጸሐፊዎች \(Clerks\)/i }));
+    const collectionCard = screen.getByRole('button', {
+      name: /የተከራይ ኪራይ ክፍያ አሰባሰብ/i,
+    });
+    fireEvent.click(collectionCard);
+    expect(
+      (await screen.findAllByText(/ደረጃ 1፡ ተከራይ የራሱን የሞባይል ክፍያ ገጽ ይከፍታል/i)).length
+    ).toBeGreaterThan(0);
+
+    // Jump straight into live Collections workspace
+    fireEvent.click(screen.getByRole('button', { name: /ወደ ቀጥታ ኪራይ አሰባሰብ ገጽ ሂድ/i }));
+    expect(await screen.findByRole('heading', { name: /ኪራይና አሰባሰብ/i })).toBeInTheDocument();
+  }, 15_000);
 });

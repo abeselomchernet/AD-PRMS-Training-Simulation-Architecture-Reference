@@ -30,6 +30,7 @@ export type NavSection =
   | 'reports'
   | 'requirements-acceptance'
   | 'training-exercises'
+  | 'system-demonstration'
   | 'security-architecture'
   | 'visual-qa'
   | 'governance';

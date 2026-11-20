@@ -26,6 +26,7 @@ import {
   Lock,
   LogOut,
   Menu,
+  MonitorPlay,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -88,6 +89,7 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'requirements-acceptance', labelKey: 'navRequirementsAcceptance', icon: FileCheck2, group: 'governance' },
   { id: 'governance', labelKey: 'navGovernance', icon: ShieldCheck, group: 'governance' },
   { id: 'training-exercises', labelKey: 'navTrainingExercises', icon: GraduationCap, group: 'training' },
+  { id: 'system-demonstration', labelKey: 'navSystemDemonstration', icon: MonitorPlay, group: 'training' },
   { id: 'security-architecture', labelKey: 'navSecurityArchitecture', icon: ServerCog, group: 'training' },
   { id: 'visual-qa', labelKey: 'navVisualQa', icon: Languages, group: 'training' },
 ];
@@ -103,19 +105,19 @@ function getDefaultExpandedGroups(role: PersonaRole): Record<NavGroupId, boolean
   switch (role) {
     case 'Owner / Director':
     case 'General Manager':
-      return { operations: true, finance: true, governance: true, training: false };
+      return { operations: true, finance: true, governance: true, training: true };
     case 'Assistant Manager':
-      return { operations: true, finance: true, governance: false, training: false };
+      return { operations: true, finance: true, governance: false, training: true };
     case 'Finance Officer':
     case 'Collections Clerk':
-      return { operations: true, finance: true, governance: false, training: false };
+      return { operations: true, finance: true, governance: false, training: true };
     case 'Property Clerk':
     case 'Clerk':
-      return { operations: true, finance: false, governance: false, training: false };
+      return { operations: true, finance: false, governance: false, training: true };
     case 'System Administrator':
       return { operations: false, finance: false, governance: true, training: true };
     case 'Auditor / Read-only reviewer':
-      return { operations: false, finance: true, governance: true, training: false };
+      return { operations: false, finance: true, governance: true, training: true };
     case 'Training Coordinator':
       return { operations: true, finance: false, governance: true, training: true };
     default:

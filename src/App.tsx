@@ -68,6 +68,9 @@ const RequirementsAcceptancePage = lazy(() =>
 const TrainingExercisesPage = lazy(() =>
   import('./pages/TrainingExercisesPage').then((m) => ({ default: m.TrainingExercisesPage }))
 );
+const SystemDemonstrationPage = lazy(() =>
+  import('./pages/SystemDemonstrationPage').then((m) => ({ default: m.SystemDemonstrationPage }))
+);
 const ProductionSecurityArchitecturePage = lazy(() =>
   import('./pages/ProductionSecurityArchitecturePage').then((m) => ({
     default: m.ProductionSecurityArchitecturePage,
@@ -100,6 +103,7 @@ const SECTION_LABEL_KEYS: Record<NavSection, string> = {
   reports: 'navReports',
   'requirements-acceptance': 'navRequirementsAcceptance',
   'training-exercises': 'navTrainingExercises',
+  'system-demonstration': 'navSystemDemonstration',
   'security-architecture': 'navSecurityArchitecture',
   'visual-qa': 'navVisualQa',
   governance: 'navGovernance',
@@ -198,6 +202,8 @@ const ActiveWorkspace: React.FC = () => {
         return <RequirementsAcceptancePage />;
       case 'training-exercises':
         return <TrainingExercisesPage />;
+      case 'system-demonstration':
+        return <SystemDemonstrationPage />;
       case 'security-architecture':
         return <ProductionSecurityArchitecturePage />;
       case 'visual-qa':

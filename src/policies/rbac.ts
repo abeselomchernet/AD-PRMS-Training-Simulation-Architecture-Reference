@@ -607,6 +607,7 @@ export function getModuleAccess(role: PersonaRole, section: NavSection): ModuleA
   if (
     section === 'dashboard' ||
     section === 'training-exercises' ||
+    section === 'system-demonstration' ||
     section === 'security-architecture' ||
     section === 'visual-qa' ||
     section === 'governance' ||
